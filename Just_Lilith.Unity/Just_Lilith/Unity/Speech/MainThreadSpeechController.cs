@@ -57,6 +57,16 @@ public sealed class MainThreadSpeechController
 
 	private string? _activeText;
 
+	private SpeechSynthesisRequest? _activeRequest;
+
+	private IReadOnlyList<string> _activeChunks = Array.Empty<string>();
+
+	private int _activeChunkIndex;
+
+	private PcmWaveData? _readyWave;
+
+	private bool _speechStartedReported;
+
 	private readonly TalkActionDriver _talkAction;
 
 	private CancellationTokenSource? _operation;
@@ -237,12 +247,65 @@ public sealed class MainThreadSpeechController
 			}
 		}
 		RefreshServiceState();
+		if (!CanSpeak && _activeRequest != null && !_speechStartedReported)
+		{
+			// 服务掉线或语音被关掉：把显示权交还桥，别让整条回复卡在“等语音”上。
+			_bridge.ReleaseSpeechManaged(_activeMessageId);
+			_activeChunks = Array.Empty<string>();
+			_activeChunkIndex = 0;
+			_readyWave = null;
+			_activeRequest = null;
+		}
 		if ((Object)(object)_clip != (Object)null && (Object)(object)_audio != (Object)null && !_audio.isPlaying)
 		{
-			_bridge.OnSpeechPlaybackFinished(_activeMessageId);
-			_talkAction.Finish();
-			ReleaseClip();
-			SetStatus("播放完成；等待下一条已显示的气泡。");
+			if (_activeChunkIndex + 1 < _activeChunks.Count && CanSpeak)
+			{
+				// 还有下一段：先停当前音频，再合成并显示下一段，做到文字跟着语音一段一段走。
+				_activeChunkIndex++;
+				ReleaseClip();
+				StartActiveChunk();
+			}
+			else
+			{
+				_bridge.OnSpeechPlaybackFinished(_activeMessageId);
+				_talkAction.Finish();
+				ReleaseClip();
+				_bridge.ReleaseSpeechManaged(_activeMessageId);
+				_activeChunks = Array.Empty<string>();
+				_activeChunkIndex = 0;
+				_activeRequest = null;
+				_speechStartedReported = false;
+				SetStatus("播放完成；等待下一条已显示的气泡。");
+			}
+		}
+		if (_readyWave != null && CanSpeak)
+		{
+			string text = ((_activeChunkIndex >= 0 && _activeChunkIndex < _activeChunks.Count) ? _activeChunks[_activeChunkIndex] : _activeText);
+			float holdSeconds = (float)_readyWave.DurationSeconds + 6f;
+			if (!_bridge.PresentSpeechChunk(_activeMessageId, _activeChunkIndex, Math.Max(1, _activeChunks.Count), text, holdSeconds))
+			{
+				return;
+			}
+			try
+			{
+				Play(_readyWave);
+			}
+			catch (Exception error)
+			{
+				ReleaseClip();
+				_bridge.OnSpeechPlaybackSkipped(_activeMessageId);
+				_bridge.ReleaseSpeechManaged(_activeMessageId);
+				_readyWave = null;
+				Fail(error);
+				return;
+			}
+			_readyWave = null;
+			if (!_speechStartedReported)
+			{
+				_bridge.OnSpeechPlaybackStarted(_activeMessageId);
+				_speechStartedReported = true;
+			}
+			return;
 		}
 		OrdinaryChatOutput output;
 		while (_bridge.TryDequeueTtsText(out output))
@@ -270,6 +333,7 @@ public sealed class MainThreadSpeechController
 					{
 						ReactionId = null
 					});
+					_bridge.MarkSpeechManaged(output.MessageId);
 					Enqueue(new PendingSpeech(new SpeechSynthesisRequest(output.MessageId, output.TtsText, output.SpeechLanguage, directive), output.CreatedAt, _generation));
 				}
 				else
@@ -306,6 +370,7 @@ public sealed class MainThreadSpeechController
 				{
 					ReactionId = null
 				});
+				_bridge.MarkSpeechManaged(output.MessageId);
 				Enqueue(new PendingSpeech(new SpeechSynthesisRequest(output.MessageId, output.TtsText, output.SpeechLanguage, directive2), output.CreatedAt, _generation));
 			}
 			else if (output.SpeechEnabled)
@@ -324,25 +389,22 @@ public sealed class MainThreadSpeechController
 				if (result2.Error != null)
 				{
 					_bridge.OnSpeechPlaybackSkipped(_activeMessageId);
+					if (!_speechStartedReported)
+					{
+						_bridge.ReleaseSpeechManaged(_activeMessageId);
+					}
+					_activeChunks = Array.Empty<string>();
+					_activeChunkIndex = 0;
+					_activeRequest = null;
 					Fail(result2.Error);
 				}
 				else if ((object)result2.Wave != null)
 				{
-					try
-					{
-						Play(result2.Wave);
-						_bridge.OnSpeechPlaybackStarted(_activeMessageId);
-					}
-					catch (Exception error2)
-					{
-						ReleaseClip();
-						_bridge.OnSpeechPlaybackSkipped(_activeMessageId);
-						Fail(error2);
-					}
+					_readyWave = result2.Wave;
 				}
 			}
 		}
-		if (_active != null || !((Object)(object)_clip == (Object)null) || !CanSpeak)
+		if (_active != null || !((Object)(object)_clip == (Object)null) || _readyWave != null || !CanSpeak)
 		{
 			return;
 		}
@@ -353,15 +415,56 @@ public sealed class MainThreadSpeechController
 			{
 				if (!(DateTimeOffset.UtcNow - pendingSpeech.CreatedAt > MaximumAge))
 				{
-					_operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
-					_active = RunSynthesis(pendingSpeech, Settings.ServiceUrl, _operation);
 					_activeMessageId = pendingSpeech.Request.RequestId;
 					_activeText = pendingSpeech.Request.Text;
-					SetStatus("正在合成" + ((pendingSpeech.Request.Language == SpeechLanguage.Japanese) ? "日语" : "中文") + "语音；首次切换需载入对应模型，文字已保留。");
+					_activeRequest = pendingSpeech.Request;
+					IReadOnlyList<string> readOnlyList = SpeechSplitSynthesizer.Split(pendingSpeech.Request.Text);
+					_activeChunks = ((readOnlyList.Count > 0) ? readOnlyList : new string[1] { pendingSpeech.Request.Text });
+					_activeChunkIndex = 0;
+					_speechStartedReported = false;
+					_readyWave = null;
+					StartActiveChunk();
 					break;
 				}
 				Expired("语音排队已超过 45 秒");
+				_bridge.ReleaseSpeechManaged(pendingSpeech.Request.RequestId);
 			}
+		}
+	}
+
+	/// <summary>开始合成当前段；合成完成后由 Update 在气泡上显示这一段并播放。</summary>
+	private void StartActiveChunk()
+	{
+		if (_activeRequest == null || _activeChunks.Count == 0)
+		{
+			return;
+		}
+		int index = Math.Min(_activeChunkIndex, _activeChunks.Count - 1);
+		SpeechSynthesisRequest request = _activeRequest with
+		{
+			RequestId = Guid.NewGuid(),
+			Text = _activeChunks[index]
+		};
+		_operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+		_active = RunChunkSynthesis(request, Settings.ServiceUrl, _operation);
+		SetStatus("正在合成第 " + (_activeChunkIndex + 1) + "/" + _activeChunks.Count + " 段" + ((request.Language == SpeechLanguage.Japanese) ? "日语" : "中文") + "语音；文字会跟着语音逐段出现。");
+	}
+
+	private static async Task<WorkResult> RunChunkSynthesis(SpeechSynthesisRequest request, string serviceUrl, CancellationTokenSource cancellation)
+	{
+		try
+		{
+			using LocalTtsClient client = new LocalTtsClient(serviceUrl);
+			PcmWaveData wave = await SpeechSplitSynthesizer.SynthesizeChunkAsync(client, request, cancellation.Token).ConfigureAwait(continueOnCapturedContext: false);
+			return new WorkResult(0L, DateTimeOffset.UtcNow, wave, null);
+		}
+		catch (Exception error)
+		{
+			return new WorkResult(0L, DateTimeOffset.UtcNow, null, error);
+		}
+		finally
+		{
+			cancellation.Dispose();
 		}
 	}
 
@@ -377,6 +480,7 @@ public sealed class MainThreadSpeechController
 		if (_pending.Count >= 3)
 		{
 			PendingSpeech pendingSpeech = _pending.Dequeue();
+			_bridge.ReleaseSpeechManaged(pendingSpeech.Request.RequestId);
 			_bridge.OnSpeechPlaybackSkipped(pendingSpeech.Request.RequestId);
 			_log.LogInfo((object)"module=TTS; event=backlog_trimmed; text_logged=false");
 		}
@@ -388,7 +492,7 @@ public sealed class MainThreadSpeechController
 		try
 		{
 			using LocalTtsClient client = new LocalTtsClient(serviceUrl);
-			PcmWaveData wave = await SpeechSplitSynthesizer.SynthesizeAsync(client, next.Request, cancellation.Token).ConfigureAwait(continueOnCapturedContext: false);
+			PcmWaveData wave = await SpeechSplitSynthesizer.SynthesizeChunkAsync(client, next.Request, cancellation.Token).ConfigureAwait(continueOnCapturedContext: false);
 			return new WorkResult(next.Generation, next.CreatedAt, wave, null);
 		}
 		catch (Exception error)
@@ -631,6 +735,15 @@ public sealed class MainThreadSpeechController
 		RequestStop();
 		_generation++;
 		_pending.Clear();
+		if (_activeMessageId != Guid.Empty)
+		{
+			_bridge.ReleaseSpeechManaged(_activeMessageId);
+			_activeMessageId = Guid.Empty;
+		}
+		_activeChunks = Array.Empty<string>();
+		_activeChunkIndex = 0;
+		_readyWave = null;
+		_activeRequest = null;
 		_bridge.ClearPendingSpeech();
 		Action result;
 		while (_mainActions.TryDequeue(out result))

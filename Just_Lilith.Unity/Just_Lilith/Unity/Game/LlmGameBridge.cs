@@ -24,6 +24,9 @@ internal sealed class LlmGameBridge : IOrdinaryChatOutputSink, IThinkingBubbleSi
 
 		public bool SpeechPlaybackStarted { get; set; }
 
+		/// <summary>由语音控制器按切片托管显示：桥不再一下子把整段文字推给气泡。</summary>
+		public bool SpeechManaged { get; set; }
+
 		public PendingBubble(OrdinaryChatOutput output, DateTimeOffset enqueuedAt)
 		{
 			Output = output;
@@ -209,6 +212,7 @@ internal sealed class LlmGameBridge : IOrdinaryChatOutputSink, IThinkingBubbleSi
 			foreach (PendingBubble item in _bubbleQueue)
 			{
 				item.SpeechSuppressed = true;
+				item.SpeechManaged = false;
 				if (!item.SpeechPlaybackStarted)
 				{
 					item.SpeechPlaybackStarted = true;
@@ -270,6 +274,124 @@ internal sealed class LlmGameBridge : IOrdinaryChatOutputSink, IThinkingBubbleSi
 		}
 	}
 
+	/// <summary>告诉桥：这条回复的显示改由语音控制器按切片驱动，别整段推气泡。</summary>
+	public void MarkSpeechManaged(Guid messageId)
+	{
+		lock (_messageGate)
+		{
+			foreach (PendingBubble item in _bubbleQueue)
+			{
+				if (item.Output.MessageId == messageId)
+				{
+					item.SpeechManaged = true;
+					return;
+				}
+			}
+		}
+	}
+
+	/// <summary>语音不可用/失败时交还显示权，让桥按原来的整段逻辑补显示。</summary>
+	public void ReleaseSpeechManaged(Guid messageId)
+	{
+		lock (_messageGate)
+		{
+			foreach (PendingBubble item in _bubbleQueue)
+			{
+				if (item.Output.MessageId == messageId)
+				{
+					item.SpeechManaged = false;
+					return;
+				}
+			}
+		}
+	}
+
+	/// <summary>
+	/// 显示第 index 段切片（0 起）。第 0 段负责把整条气泡从未显示状态推上屏并进入托管；
+	/// 后续段只刷新气泡文字，让文字跟着语音一段一段走。返回 false 表示这一帧放不进去，调用方下一帧重试。
+	/// </summary>
+	public bool PresentSpeechChunk(Guid messageId, int index, int count, string? chunkText, float holdSeconds)
+	{
+		if (Volatile.Read(ref _disposed) != 0)
+		{
+			return false;
+		}
+		if (!ResolveDialogueManager())
+		{
+			return false;
+		}
+		string text = EscapeRichText(string.IsNullOrWhiteSpace(chunkText) ? "" : chunkText);
+		// 我们自己在推气泡：这期间别让回退服务把同一句再播一遍。
+		VoiceFallbackService.SuppressFor(TimeSpan.FromSeconds(20.0));
+		float keepAlive = Mathf.Max((float)BubblePresentationTiming.KeepAliveNodeDuration.TotalSeconds, holdSeconds);
+		PendingBubble pendingBubble = null;
+		lock (_messageGate)
+		{
+			foreach (PendingBubble item in _bubbleQueue)
+			{
+				if (item.Output.MessageId == messageId)
+				{
+					pendingBubble = item;
+					break;
+				}
+			}
+		}
+		if (pendingBubble != null && index == 0)
+		{
+			if (IsDialogueActive() && !IsOwnedBubbleCurrent())
+			{
+				return false;
+			}
+			VoiceFallbackService.SuppressFor(TimeSpan.FromSeconds(20.0));
+			try
+			{
+				if (!(_forceSay?.Invoke(_dialogueManager, new object[3] { text, "", keepAlive }) is bool flag && flag))
+				{
+					return false;
+				}
+			}
+			catch (TargetInvocationException)
+			{
+				InvalidateManager();
+				return false;
+			}
+			BubblePresentationSchedule bubblePresentationSchedule = BubbleSpeechSync.Plan(pendingBubble.Output);
+			CompleteAccepted(pendingBubble, bubblePresentationSchedule);
+			_lastShownText = text;
+			_replyHoldSeconds = keepAlive;
+			_log.LogInfo("module=GameBridge; event=speech_chunk_shown; index=1; total=" + count + "; chars=" + ((chunkText == null) ? 0 : chunkText.Length));
+			return true;
+		}
+		if (index > 0)
+		{
+			// 气泡可能已经被游戏收走：这时重新把它推上来，保证这一段文字不会缺席。
+			bool flag2 = IsOwnedBubbleCurrent();
+			try
+			{
+				if (!(_forceSay?.Invoke(_dialogueManager, new object[3] { text, "", keepAlive }) is bool flag3 && flag3) && !flag2)
+				{
+					return false;
+				}
+			}
+			catch (TargetInvocationException)
+			{
+				InvalidateManager();
+				return false;
+			}
+			_lastShownText = text;
+			_replyHoldActive = true;
+			_replyTypingClosed = false;
+			_replyHoldStartedAt = Time.unscaledTime;
+			_replyTypingObserved = 0f;
+			_replyTypingFloor = (float)BubblePresentationTiming.PlanTypingDuration(chunkText).TotalSeconds;
+			_replyHoldSeconds = keepAlive;
+			_log.LogInfo("module=GameBridge; event=speech_chunk_shown; index=" + (index + 1) + "; total=" + count + "; chars=" + ((chunkText == null) ? 0 : chunkText.Length) + ((!flag2) ? "; rebubble=1" : ""));
+			return true;
+		}
+		return false;
+	}
+
+
 	public void Update()
 	{
 		if (Volatile.Read(ref _disposed) != 0)
@@ -283,14 +405,14 @@ internal sealed class LlmGameBridge : IOrdinaryChatOutputSink, IThinkingBubbleSi
 		lock (_messageGate)
 		{
 			DateTimeOffset utcNow = DateTimeOffset.UtcNow;
-			while (_bubbleQueue.Count > 0 && BubbleDeliveryRetryPolicy.HasExpired(_bubbleQueue.Peek().EnqueuedAt, utcNow))
+			while (_bubbleQueue.Count > 0 && !_bubbleQueue.Peek().SpeechManaged && BubbleDeliveryRetryPolicy.HasExpired(_bubbleQueue.Peek().EnqueuedAt, utcNow))
 			{
 				PendingBubble pendingBubble = _bubbleQueue.Dequeue();
 				RemoveTtsMessageNoLock(pendingBubble.Output.MessageId);
 				list.Add(pendingBubble);
 				_lastDeliveryStatus = "气泡超时 " + MessageTag(pendingBubble.Output.MessageId);
 			}
-			if (_bubbleQueue.Count == 0 || Time.unscaledTime < _nextAttemptAt)
+			if (_bubbleQueue.Count == 0 || Time.unscaledTime < _nextAttemptAt || _bubbleQueue.Peek().SpeechManaged)
 			{
 				pendingBubble2 = null;
 			}

@@ -339,6 +339,43 @@ internal static class SpeechSplitSynthesizer
 		return text;
 	}
 
+	/// <summary>
+	/// 只做分片，不合成。聊天侧按这些切片逐段合成、逐段显示，
+	/// 用于让气泡文字与语音一段一段对齐。
+	/// </summary>
+	internal static IReadOnlyList<string> Split(string? text)
+	{
+		string text2 = SpeechTextSanitizer.StripTrailingSignature(text);
+		if (string.IsNullOrWhiteSpace(text2))
+		{
+			return Array.Empty<string>();
+		}
+		List<SpeechChunk> list = BuildChunks(text2);
+		if (list.Count <= 1)
+		{
+			return new string[1] { text2 };
+		}
+		List<string> list2 = new List<string>(list.Count);
+		foreach (SpeechChunk item in list)
+		{
+			if (!string.IsNullOrWhiteSpace(item.Text))
+			{
+				list2.Add(item.Text);
+			}
+		}
+		if (list2.Count == 0)
+		{
+			return new string[1] { text2 };
+		}
+		return list2;
+	}
+
+	/// <summary>合成单个切片（带静音/坏波重试）。</summary>
+	internal static Task<PcmWaveData> SynthesizeChunkAsync(LocalTtsClient client, SpeechSynthesisRequest request, CancellationToken token)
+	{
+		return SynthesizeSingleValidatedAsync(client, request, token);
+	}
+
 	private static int SpeakableCount(string text)
 	{
 		int num = 0;
