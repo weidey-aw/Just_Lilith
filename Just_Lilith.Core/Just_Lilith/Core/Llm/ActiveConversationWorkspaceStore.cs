@@ -83,6 +83,11 @@ public sealed class ActiveConversationWorkspaceStore
 
 		[JsonPropertyName("occurred_at_utc")]
 		public string OccurredAtUtc { get; init; } = "";
+
+		/// <summary>主动对话的一轮：只在 true 时才写这个字段，普通会话文件的形状保持不变。</summary>
+		[JsonPropertyName("ambient")]
+		[JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+		public bool Ambient { get; init; }
 	}
 
 	private const int SessionSchemaVersion = 3;
@@ -345,6 +350,63 @@ public sealed class ActiveConversationWorkspaceStore
 		}
 	}
 
+	/// <summary>
+	/// 追加一轮"角色主动说的"内容：没有用户发言（User 为空），IsAmbient = true。
+	/// revision / fingerprint / activation 校验与 <see cref="AppendCompletedTurn"/> 一致，
+	/// 但走自己的校验——<b>不能调 EnsureCanAppend</b>，空 user 会被文本校验挡掉。
+	/// 落盘仍然是一对事件（UserInput("") + LlmReply），保证"事件数恒为偶数、按对配对"的既有约定。
+	/// </summary>
+	public ActiveConversationSnapshot AppendAmbientTurn(string sessionId, long expectedRevision, string assistant, DateTimeOffset assistantAt, string? expectedEventsFingerprint = null, string? expectedActivationToken = null)
+	{
+		ValidateSessionId(sessionId);
+		ValidateTurnText(assistant);
+		ValidateTimes(assistantAt, assistantAt);
+		if (expectedRevision < 0)
+		{
+			throw RevisionError();
+		}
+		lock (gate)
+		{
+			ActiveConversationSnapshot activeConversationSnapshot = ReadActiveAndCheckId(sessionId);
+			if (expectedActivationToken != null && !string.Equals(activeConversationSnapshot.ActivationToken, expectedActivationToken, StringComparison.Ordinal))
+			{
+				throw new LlmException("conversation_changed", "活动会话已切换；本次主动台词未写入新会话。");
+			}
+			ValidateAppendCapacity(activeConversationSnapshot, expectedRevision, "");
+			if (expectedEventsFingerprint != null && !string.Equals(activeConversationSnapshot.EventsFingerprint, expectedEventsFingerprint, StringComparison.Ordinal))
+			{
+				throw new LlmException("conversation_changed", "会话内容已被编辑，请重新载入后再试。");
+			}
+			DateTimeOffset? dateTimeOffset = LastSourceTime(activeConversationSnapshot);
+			if (dateTimeOffset.HasValue && dateTimeOffset.GetValueOrDefault() > assistantAt)
+			{
+				throw new LlmException("conversation_time", "新的时间早于已有会话；原会话保持不变。");
+			}
+			long revision;
+			try
+			{
+				revision = checked(activeConversationSnapshot.Conversation.Revision + 1);
+			}
+			catch (OverflowException)
+			{
+				throw RevisionError();
+			}
+			ConversationEvent[] events = activeConversationSnapshot.Conversation.Events.Concat(new ConversationEvent[2]
+			{
+				new ConversationEvent(ConversationEventType.UserInput, "", assistantAt, Ambient: true),
+				new ConversationEvent(ConversationEventType.LlmReply, assistant, assistantAt, Ambient: true)
+			}).ToArray();
+			ActiveConversationSnapshot activeConversationSnapshot2 = Snapshot(sessionId, revision, events, activeConversationSnapshot.DisplayName)with
+			{
+				ActivationToken = activeConversationSnapshot.ActivationToken,
+				ShortTermMemories = activeConversationSnapshot.ShortTermMemories,
+				LongTermMemories = activeConversationSnapshot.LongTermMemories
+			};
+			WriteSession(activeConversationSnapshot2);
+			return activeConversationSnapshot2;
+		}
+	}
+
 	public ActiveConversationSnapshot ReloadForMemory(ActiveConversationSnapshot expected)
 	{
 		ArgumentNullException.ThrowIfNull(expected, "expected");
@@ -498,7 +560,7 @@ public sealed class ActiveConversationWorkspaceStore
 					{
 						ValidateSessionId(text3);
 						ActiveConversationSnapshot activeConversationSnapshot = ReadSession(text3, text4);
-						list.Add(new ActiveConversationInfo(text3, activeConversationSnapshot.Conversation.Turns.Count, LastSourceTime(activeConversationSnapshot), (activeConversationSnapshot.Conversation.Events.Count == 0) ? null : activeConversationSnapshot.Conversation.Events[0].Content, isActive, null)
+						list.Add(new ActiveConversationInfo(text3, activeConversationSnapshot.Conversation.Turns.Count, LastSourceTime(activeConversationSnapshot), FirstUserPreview(activeConversationSnapshot), isActive, null)
 						{
 							DisplayName = activeConversationSnapshot.DisplayName
 						});
@@ -1147,10 +1209,11 @@ public sealed class ActiveConversationWorkspaceStore
 		ConversationEventType type;
 		string text;
 		DateTimeOffset result;
-		for (; arrayEnumerator.MoveNext(); list.Add(new ConversationEvent(type, text, result)))
+		bool ambient = false;
+		for (; arrayEnumerator.MoveNext(); list.Add(new ConversationEvent(type, text, result, ambient)))
 		{
 			JsonElement current = arrayEnumerator.Current;
-			RequireProperties(current, "event_type", "content", "occurred_at_utc");
+			RequireEventProperties(current);
 			type = ((list.Count % 2 != 0) ? ConversationEventType.LlmReply : ConversationEventType.UserInput);
 			JsonElement property = current.GetProperty("event_type");
 			JsonElement property2 = current.GetProperty("content");
@@ -1159,8 +1222,22 @@ public sealed class ActiveConversationWorkspaceStore
 			{
 				throw FormatError();
 			}
+			ambient = ReadAmbientFlag(current);
+			// 主动轮次的那一对事件必须同进同出；正常轮次则都是 false。
+			if (type == ConversationEventType.LlmReply && list.Count > 0 && list[list.Count - 1].Ambient != ambient)
+			{
+				throw FormatError();
+			}
 			text = property2.GetString();
-			ValidateTurnText(text);
+			// 主动轮次的"用户发言"本来就该是空的；其余内容仍然必须是有效文本。
+			if (!(ambient && type == ConversationEventType.UserInput))
+			{
+				ValidateTurnText(text);
+			}
+			else if (!string.IsNullOrEmpty(text))
+			{
+				throw FormatError();
+			}
 			string text2 = property3.GetString();
 			if (text2 != null && DateTimeOffset.TryParseExact(text2, "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out result) && !(result.Offset != TimeSpan.Zero) && !(result < EarliestEvent) && !(result > DateTimeOffset.UtcNow + MaximumFutureClockSkew) && string.Equals(result.UtcDateTime.ToString("O", CultureInfo.InvariantCulture), text2, StringComparison.Ordinal))
 			{
@@ -1176,6 +1253,65 @@ public sealed class ActiveConversationWorkspaceStore
 			throw FormatError();
 		}
 		return list;
+	}
+
+	/// <summary>
+	/// 会话列表的预览文本：取第一条有文字的事件。
+	/// 主动轮次的"用户发言"是空字符串，直接拿 Events[0] 会在列表里留一行空白。
+	/// </summary>
+	private static string? FirstUserPreview(ActiveConversationSnapshot snapshot)
+	{
+		foreach (ConversationEvent item in snapshot.Conversation.Events)
+		{
+			if (!string.IsNullOrWhiteSpace(item.Content))
+			{
+				return item.Content;
+			}
+		}
+		return null;
+	}
+
+	/// <summary>事件对象的属性校验：三种旧属性必须有，ambient 可选（旧会话文件没有它）。</summary>
+	private static void RequireEventProperties(JsonElement element)
+	{
+		if (element.ValueKind != JsonValueKind.Object)
+		{
+			throw FormatError();
+		}
+		HashSet<string> hashSet = new HashSet<string>(StringComparer.Ordinal);
+		foreach (JsonProperty item in element.EnumerateObject())
+		{
+			string name = item.Name;
+			if (name != "event_type" && name != "content" && name != "occurred_at_utc" && name != "ambient")
+			{
+				throw FormatError();
+			}
+			if (!hashSet.Add(name))
+			{
+				throw FormatError();
+			}
+		}
+		if (!hashSet.Contains("event_type") || !hashSet.Contains("content") || !hashSet.Contains("occurred_at_utc"))
+		{
+			throw FormatError();
+		}
+	}
+
+	private static bool ReadAmbientFlag(JsonElement element)
+	{
+		if (!element.TryGetProperty("ambient", out JsonElement value))
+		{
+			return false;
+		}
+		switch (value.ValueKind)
+		{
+		case JsonValueKind.True:
+			return true;
+		case JsonValueKind.False:
+			return false;
+		default:
+			throw FormatError();
+		}
 	}
 
 	private static void ValidateAppendCapacity(ActiveConversationSnapshot current, long expectedRevision, string user)
@@ -1270,7 +1406,8 @@ public sealed class ActiveConversationWorkspaceStore
 			{
 				EventType = EventName(item.Type),
 				Content = item.Content,
-				OccurredAtUtc = item.OccurredAtUtc.UtcDateTime.ToString("O", CultureInfo.InvariantCulture)
+				OccurredAtUtc = item.OccurredAtUtc.UtcDateTime.ToString("O", CultureInfo.InvariantCulture),
+				Ambient = item.Ambient
 			}).ToArray(),
 			ShortTermMemories = session.ShortTermMemories.Select(ToMemoryFile).ToArray(),
 			LongTermMemories = session.LongTermMemories.Select(ToMemoryFile).ToArray()

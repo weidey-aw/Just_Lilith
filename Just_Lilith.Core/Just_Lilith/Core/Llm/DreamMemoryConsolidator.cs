@@ -108,6 +108,15 @@ public sealed class DreamMemoryConsolidator
 		List<ChatMessage> list = new List<ChatMessage>(turns.Count * 2 + 1);
 		foreach (ConversationTurn turn in turns)
 		{
+			if (turn.IsAmbient)
+			{
+				// 主动轮次里没有用户发言，别把空字符串当"用户说过的话"喂给整理器。
+				if (!string.IsNullOrWhiteSpace(turn.Assistant))
+				{
+					list.Add(new ChatMessage(ChatRole.Assistant, ConversationContextBuilder.AmbientPrefix + turn.Assistant));
+				}
+				continue;
+			}
 			list.Add(new ChatMessage(ChatRole.User, turn.User));
 			list.Add(new ChatMessage(ChatRole.Assistant, turn.Assistant));
 		}

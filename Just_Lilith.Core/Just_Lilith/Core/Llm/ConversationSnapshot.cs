@@ -26,7 +26,7 @@ public sealed class ConversationSnapshot
 		{
 			ConversationEvent conversationEvent = Events[index * 2];
 			ConversationEvent conversationEvent2 = Events[index * 2 + 1];
-			return new ConversationTurn(conversationEvent.Content, conversationEvent2.Content, conversationEvent.OccurredAtUtc, conversationEvent2.OccurredAtUtc);
+			return new ConversationTurn(conversationEvent.Content, conversationEvent2.Content, conversationEvent.OccurredAtUtc, conversationEvent2.OccurredAtUtc, conversationEvent.Ambient || conversationEvent2.Ambient);
 		}).ToArray());
 	}
 }

@@ -153,9 +153,16 @@ public sealed class OpenAiCompatibleClient : IDisposable
 		for (int i = 0; i < messages.Count; i++)
 		{
 			ChatMessage chatMessage = messages[i];
-			if ((object)chatMessage == null || chatMessage.Role != (ChatRole)((i % 2 != 0) ? 1 : 0))
+			if ((object)chatMessage == null || !Enum.IsDefined(typeof(ChatRole), chatMessage.Role))
 			{
-				throw new LlmException("conversation_format", "对话消息须从用户开始，按用户与助手交替排列，并以用户消息结束。");
+				throw new LlmException("conversation_format", "对话消息角色不正确；请检查会话记录。");
+			}
+			// 主动对话会让历史里出现"她自己说的"连续助手消息（没有对应用户发言），
+			// 也会把本轮由头作为最后一条系统指令发出去，所以这里不再强制 user/assistant 交替。
+			// 系统指令仍然只允许出现在最后一条，避免把指令混进历史。
+			if (chatMessage.Role == ChatRole.System && i != messages.Count - 1)
+			{
+				throw new LlmException("conversation_format", "系统指令只能是本次请求的最后一条消息。");
 			}
 			if (string.IsNullOrWhiteSpace(chatMessage.Content) || chatMessage.Content.Length > 65536)
 			{
@@ -168,15 +175,16 @@ public sealed class OpenAiCompatibleClient : IDisposable
 			}
 			list.Add(new Dictionary<string, string>
 			{
-				["role"] = ((chatMessage.Role == ChatRole.User) ? "user" : "assistant"),
+				["role"] = RoleName(chatMessage.Role),
 				["content"] = chatMessage.Content
 			});
 		}
-		if (messages.Count % 2 == 0)
+		ChatRole lastRole = messages[messages.Count - 1].Role;
+		if (lastRole != ChatRole.User && lastRole != ChatRole.System)
 		{
-			throw new LlmException("conversation_format", "最新一条消息须为用户输入。");
+			throw new LlmException("conversation_format", "最新一条消息须为用户输入或系统指令。");
 		}
-		if (!string.IsNullOrWhiteSpace(currentReferenceContext))
+		if (!string.IsNullOrWhiteSpace(currentReferenceContext) && lastRole == ChatRole.User)
 		{
 			string text = currentReferenceContext + "\n\n[本轮用户消息]\n" + list[list.Count - 1]["content"];
 			if (text.Length <= 65536)
@@ -481,6 +489,22 @@ public sealed class OpenAiCompatibleClient : IDisposable
 			return value5.GetString() ?? "";
 		}
 		return "";
+	}
+
+	/// <summary>ChatRole → OpenAI 的 role 字段。chat/completions 与 responses 共用同一份映射。</summary>
+	private static string RoleName(ChatRole role)
+	{
+		switch (role)
+		{
+		case ChatRole.User:
+			return "user";
+		case ChatRole.Assistant:
+			return "assistant";
+		case ChatRole.System:
+			return "system";
+		default:
+			return "user";
+		}
 	}
 
 	private static string VisibleContent(JsonElement content, bool responses)

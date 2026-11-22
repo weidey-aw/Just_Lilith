@@ -20,10 +20,50 @@ public static class ConversationContextBuilder
 		List<ChatMessage> list = new List<ChatMessage>();
 		foreach (ConversationTurn turn in session.Conversation.Turns)
 		{
+			// 主动轮次没有用户发言：只补她那半句，别塞一条空 user 消息
+			// （空消息会被请求校验拒掉，用户下一次正常聊天就发不出去了）。
+			if (turn.IsAmbient)
+			{
+				if (!string.IsNullOrWhiteSpace(turn.Assistant))
+				{
+					list.Add(new ChatMessage(ChatRole.Assistant, AmbientPrefix + turn.Assistant));
+				}
+				continue;
+			}
 			list.Add(new ChatMessage(ChatRole.User, turn.User));
 			list.Add(new ChatMessage(ChatRole.Assistant, turn.Assistant));
 		}
 		list.Add(new ChatMessage(ChatRole.User, input));
+		return list.AsReadOnly();
+	}
+
+	/// <summary>主动轮次在历史里的前缀，用来和"回应用户"的发言区分开。</summary>
+	public const string AmbientPrefix = "（她主动说的）";
+
+	/// <summary>
+	/// 主动对话的上下文：历史照常渲染（<see cref="ConversationTurn.IsAmbient"/> 的轮次只保留她那半句，
+	/// 加"（她主动说的）"前缀，不造空用户消息），最后追加一条 System 指令。
+	/// <b>不追加 user</b>——由头只是本次请求的指令，不落历史。正常聊天不要用这个方法。
+	/// </summary>
+	public static IReadOnlyList<ChatMessage> BuildProactive(ActiveConversationSnapshot session, string instruction)
+	{
+		ArgumentNullException.ThrowIfNull(session, "session");
+		ArgumentNullException.ThrowIfNull(instruction, "instruction");
+		List<ChatMessage> list = new List<ChatMessage>();
+		foreach (ConversationTurn turn in session.Conversation.Turns)
+		{
+			if (turn.IsAmbient)
+			{
+				if (!string.IsNullOrWhiteSpace(turn.Assistant))
+				{
+					list.Add(new ChatMessage(ChatRole.Assistant, AmbientPrefix + turn.Assistant));
+				}
+				continue;
+			}
+			list.Add(new ChatMessage(ChatRole.User, turn.User));
+			list.Add(new ChatMessage(ChatRole.Assistant, turn.Assistant));
+		}
+		list.Add(new ChatMessage(ChatRole.System, instruction));
 		return list.AsReadOnly();
 	}
 
