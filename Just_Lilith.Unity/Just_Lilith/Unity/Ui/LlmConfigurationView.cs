@@ -195,6 +195,8 @@ public sealed class LlmConfigurationView : MonoBehaviour
 
 	private GameObject? _chatPanel;
 
+	private ChatPanelPlacement? _chatPlacement;
+
 	private GameObject? _gameSettingsTab;
 
 	private Button? _gameSettingsTabButton;
@@ -798,6 +800,11 @@ public sealed class LlmConfigurationView : MonoBehaviour
 				MaintainNativeAgent();
 				MaintainNativeLilithConversations();
 				MaintainJourneyDialogDrag();
+				if (_chatPlacement != null)
+				{
+					_chatPlacement.HoldSteady = _chatInput != null && _chatInput.isFocused;
+					_chatPlacement.Tick();
+				}
 				HandleKeyboard();
 			}
 		}
@@ -1469,6 +1476,28 @@ public sealed class LlmConfigurationView : MonoBehaviour
 		return _allInputs.Any((InputField input) => input != null && input != _chatInput && input.isFocused);
 	}
 
+	private void EnsureChatPlacement()
+	{
+		if (_chatPlacement != null || _chatPanel == null || _uiRoot == null || _log == null)
+		{
+			return;
+		}
+		try
+		{
+			RectTransform component = _uiRoot.GetComponent<RectTransform>();
+			Canvas component2 = _uiRoot.GetComponent<Canvas>();
+			RectTransform component3 = _chatPanel.GetComponent<RectTransform>();
+			if (!(component == null) && !(component2 == null) && !(component3 == null))
+			{
+				_chatPlacement = new ChatPanelPlacement(component3, component, component2, _log);
+			}
+		}
+		catch (Exception error)
+		{
+			SafeLogCallbackError("EnsureChatPlacement", error);
+		}
+	}
+
 	private void ToggleChat(string source)
 	{
 		if (!(_chatPanel == null))
@@ -1561,6 +1590,8 @@ public sealed class LlmConfigurationView : MonoBehaviour
 		if (!(_chatPanel == null) && !(_chatInput == null))
 		{
 			bool flag = _keyboard.SetNeeded(needed: true);
+			EnsureChatPlacement();
+			_chatPlacement?.ApplyNow();
 			_chatPanel.SetActive(value: true);
 			_chatPanel.transform.SetAsLastSibling();
 			_chatFocusPendingUntil = Time.unscaledTime + 0.45f;

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     编译并打包 Just_Lilith（BepInEx IL2CPP 插件）。
 
