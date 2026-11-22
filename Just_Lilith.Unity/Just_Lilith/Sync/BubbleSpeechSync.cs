@@ -14,6 +14,8 @@ public static class BubbleSpeechSync
 
 	public const double ClosingTailSeconds = 3.0;
 
+	public const double SpeechWaitFallbackSeconds = 12.0;
+
 	private static int Length(string text)
 	{
 		return text?.Count((char c) => !char.IsWhiteSpace(c)) ?? 0;
@@ -28,6 +30,11 @@ public static class BubbleSpeechSync
 		return false;
 	}
 
+	public static bool HasSpeechText(OrdinaryChatOutput o)
+	{
+		return HasSpeech(o);
+	}
+
 	public static BubblePresentationSchedule Plan(OrdinaryChatOutput o)
 	{
 		BubblePresentationSchedule result = BubblePresentationTiming.Plan(o.DisplayText, o.TtsText, o.SpeechLanguage, o.SpeechEnabled);
@@ -35,10 +42,9 @@ public static class BubbleSpeechSync
 		{
 			return result;
 		}
-		double delay = Math.Clamp(1.25 + (double)Length(o.TtsText) / 60.0, 1.25, 4.0);
-		double hold = Math.Max(result.HoldDuration.TotalSeconds + 3.0, Math.Max((double)Length(o.DisplayText) / 6.5, (double)Length(o.TtsText) / 4.5) + 3.0);
-		double typing = BubblePresentationTiming.PlanTypingDuration(o.DisplayText).TotalSeconds;
-		return new BubblePresentationSchedule(TimeSpan.FromSeconds(delay), TimeSpan.FromSeconds(typing + hold), TimeSpan.FromSeconds(hold));
+		double value = Math.Clamp(1.25 + (double)Length(o.TtsText) / 60.0, 1.25, 4.0);
+		double num = Math.Max(result.HoldDuration.TotalSeconds + 3.0, Math.Max((double)Length(o.DisplayText) / 6.5, (double)Length(o.TtsText) / 4.5) + 3.0);
+		return new BubblePresentationSchedule(VisibleDuration: TimeSpan.FromSeconds(BubblePresentationTiming.PlanTypingDuration(o.DisplayText).TotalSeconds + num), Delay: TimeSpan.FromSeconds(value), HoldDuration: TimeSpan.FromSeconds(num));
 	}
 
 	public static bool IsReady(DateTimeOffset enqueuedAt, DateTimeOffset now, OrdinaryChatOutput o)
@@ -59,7 +65,14 @@ public static class BubbleSpeechSync
 		{
 			if (queue.Count >= 16)
 			{
-				queue.Dequeue();
+				OrdinaryChatOutput ordinaryChatOutput = queue.Dequeue();
+				try
+				{
+					bridge.GetType().GetMethod("OnSpeechPlaybackSkipped", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.Invoke(bridge, new object[1] { ordinaryChatOutput.MessageId });
+				}
+				catch
+				{
+				}
 			}
 			queue.Enqueue(output);
 		}

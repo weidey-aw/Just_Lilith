@@ -22,6 +22,8 @@ internal sealed class LlmGameBridge : IOrdinaryChatOutputSink, IThinkingBubbleSi
 
 		public bool SpeechSuppressed { get; set; }
 
+		public bool SpeechPlaybackStarted { get; set; }
+
 		public PendingBubble(OrdinaryChatOutput output, DateTimeOffset enqueuedAt)
 		{
 			Output = output;
@@ -72,6 +74,10 @@ internal sealed class LlmGameBridge : IOrdinaryChatOutputSink, IThinkingBubbleSi
 	private float _nextThinkingAt;
 
 	private string? _lastShownText;
+
+	private Guid _lastShownMessageId;
+
+	private Guid _speakingMessageId;
 
 	private bool _replyHoldActive;
 
@@ -196,12 +202,70 @@ internal sealed class LlmGameBridge : IOrdinaryChatOutputSink, IThinkingBubbleSi
 
 	public void ClearPendingSpeech()
 	{
+		List<Guid> resolvedMessages = new List<Guid>();
 		lock (_messageGate)
 		{
 			_ttsQueue.Clear();
 			foreach (PendingBubble item in _bubbleQueue)
 			{
 				item.SpeechSuppressed = true;
+				if (!item.SpeechPlaybackStarted)
+				{
+					item.SpeechPlaybackStarted = true;
+					resolvedMessages.Add(item.Output.MessageId);
+				}
+			}
+		}
+		foreach (Guid messageId in resolvedMessages)
+		{
+			SpeechResolved?.Invoke(messageId);
+		}
+	}
+
+	public event Action<Guid>? SpeechResolved;
+
+	public void OnSpeechPlaybackStarted(Guid messageId)
+	{
+		_speakingMessageId = messageId;
+		if (messageId == _lastShownMessageId && _replyHoldActive)
+		{
+			_replyHoldStartedAt = Time.unscaledTime - Math.Max(_replyTypingObserved, _replyTypingFloor);
+		}
+		MarkSpeechResolved(messageId, started: true);
+		SpeechResolved?.Invoke(messageId);
+	}
+
+	public void OnSpeechPlaybackSkipped(Guid messageId)
+	{
+		MarkSpeechResolved(messageId, started: true);
+		SpeechResolved?.Invoke(messageId);
+	}
+
+	public void OnSpeechPlaybackFinished(Guid messageId)
+	{
+		if (messageId == Guid.Empty)
+		{
+			return;
+		}
+		_speakingMessageId = Guid.Empty;
+		if (messageId == _lastShownMessageId && _replyHoldActive)
+		{
+			_replyHoldSeconds = (float)BubblePresentationTiming.PostSpeechTailSeconds.TotalSeconds;
+			_replyHoldStartedAt = Time.unscaledTime - Math.Max(_replyTypingObserved, _replyTypingFloor);
+		}
+	}
+
+	private void MarkSpeechResolved(Guid messageId, bool started)
+	{
+		lock (_messageGate)
+		{
+			foreach (PendingBubble item in _bubbleQueue)
+			{
+				if (item.Output.MessageId == messageId)
+				{
+					item.SpeechPlaybackStarted = started;
+					break;
+				}
 			}
 		}
 	}
@@ -287,6 +351,7 @@ internal sealed class LlmGameBridge : IOrdinaryChatOutputSink, IThinkingBubbleSi
 				_ = pendingBubble2.Output.SpeechEnabled;
 				BubblePresentationSchedule timing = BubbleSpeechSync.Plan(pendingBubble2.Output);
 				float num = (float)BubblePresentationTiming.KeepAliveNodeDuration.TotalSeconds;
+				VoiceFallbackService.SuppressFor(TimeSpan.FromSeconds(20.0));
 				obj = _forceSay?.Invoke(_dialogueManager, new object[3] { text, "", num });
 				if (obj is bool && (bool)obj)
 				{
@@ -346,6 +411,7 @@ internal sealed class LlmGameBridge : IOrdinaryChatOutputSink, IThinkingBubbleSi
 		_thinkingShown = false;
 		_thinkingShownAt = 0f;
 		_lastShownText = EscapeRichText(accepted.Output.DisplayText);
+		_lastShownMessageId = accepted.Output.MessageId;
 		_replyHoldActive = true;
 		_replyTypingClosed = false;
 		_replyHoldStartedAt = Time.unscaledTime;

@@ -5,6 +5,7 @@ using BepInEx.Core.Logging.Interpolation;
 using BepInEx.Logging;
 using Il2CppInterop.Runtime.Attributes;
 using Just_Lilith.Core.Threading;
+using Just_Lilith.Unity.Game;
 using UnityEngine;
 
 namespace Just_Lilith.Unity;
@@ -87,6 +88,13 @@ public sealed class MainThreadPump(IntPtr pointer) : MonoBehaviour(pointer)
 				});
 			}
 			dispatcher.Pump();
+			try
+			{
+				VoiceFallbackService.TickSignedNativePreload();
+			}
+			catch
+			{
+			}
 			if (!_readyNotification.IsFaulted)
 			{
 				return;

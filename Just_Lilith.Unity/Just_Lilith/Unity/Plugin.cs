@@ -36,6 +36,8 @@ public sealed class Plugin : BasePlugin
 
 	private MainThreadSpeechController? _speech;
 
+	private VoiceFallbackService? _voiceFallback;
+
 	private CancellationTokenSource? _lifetime;
 
 	private Task? _startup;
@@ -148,6 +150,21 @@ public sealed class Plugin : BasePlugin
 				}
 				_configuration = new LlmConfigurationController(dispatcher, _view, Path.Combine(Paths.ConfigPath, "local.just_lilith.llm.json"), Path.Combine(Paths.ConfigPath, "local.just_lilith.workspace"), base.Log, _gameBridge, _petState, _speech, Paths.GameRootPath);
 				_configuration.Initialize();
+				try
+				{
+					if (_voiceFallback == null)
+					{
+						_voiceFallback = new VoiceFallbackService(_speech, base.Log);
+					}
+					_voiceFallback.AttachSpeech(_speech);
+					_voiceFallback.Install();
+					_ = _voiceFallback.EnsureCacheAsync(cancellationToken);
+					base.Log.LogInfo("module=VoiceFallback; event=cache_started");
+				}
+				catch (Exception ex4)
+				{
+					base.Log.LogWarning("module=VoiceFallback; event=init_failed; code=" + ex4.GetType().Name);
+				}
 			}, cancellationToken).ConfigureAwait(continueOnCapturedContext: false);
 		}
 		catch (OperationCanceledException)

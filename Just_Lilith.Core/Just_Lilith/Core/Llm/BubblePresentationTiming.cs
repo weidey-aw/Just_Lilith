@@ -40,6 +40,8 @@ public static class BubblePresentationTiming
 
 	public static TimeSpan MaximumTotalVisible { get; } = TimeSpan.FromSeconds(90.0);
 
+	public static TimeSpan PostSpeechTailSeconds { get; } = TimeSpan.FromSeconds(2.0);
+
 	public static bool IsReadyToPresent(DateTimeOffset enqueuedAt, DateTimeOffset now)
 	{
 		if (now >= enqueuedAt)
@@ -55,18 +57,16 @@ public static class BubblePresentationTiming
 		{
 			throw new ArgumentException("Display text must not be empty.", "displayText");
 		}
-		string narration = ((speechEnabled && !string.IsNullOrWhiteSpace(speechText)) ? speechText : displayText);
-		double holdSeconds = (speechEnabled ? (SpeechPreparationSeconds + EstimateNarrationSeconds(narration, speechLanguage) + AfterSpeechTailSeconds) : (EstimateReadingSeconds(displayText) + SilentReadingTailSeconds));
-		holdSeconds = Math.Clamp(holdSeconds, MinimumVisible.TotalSeconds, MaximumVisible.TotalSeconds);
-		double typingSeconds = EstimateTypingSeconds(displayText);
-		return new BubblePresentationSchedule(InitialDelay, TimeSpan.FromSeconds(typingSeconds + holdSeconds), TimeSpan.FromSeconds(holdSeconds));
+		string text = ((speechEnabled && !string.IsNullOrWhiteSpace(speechText)) ? speechText : displayText);
+		double value = (speechEnabled ? (3.0 + EstimateNarrationSeconds(text, speechLanguage) + 1.25) : (EstimateReadingSeconds(displayText) + 1.0));
+		value = Math.Clamp(value, MinimumVisible.TotalSeconds, MaximumVisible.TotalSeconds);
+		double num = EstimateTypingSeconds(displayText);
+		return new BubblePresentationSchedule(InitialDelay, TimeSpan.FromSeconds(num + value), TimeSpan.FromSeconds(value));
 	}
 
-	/// <summary>逐字显示整段文字的最短保留时间，用来避免气泡在打字完成前被打断。</summary>
 	public static TimeSpan PlanTypingDuration(string? displayText)
 	{
-		double seconds = (double)CountVisibleCharacters(displayText ?? string.Empty) / SlowTypingCharactersPerSecond;
-		return TimeSpan.FromSeconds(Math.Min(seconds, MaximumTypingEstimate.TotalSeconds));
+		return TimeSpan.FromSeconds(Math.Min((double)CountVisibleCharacters(displayText ?? string.Empty) / 18.0, MaximumTypingEstimate.TotalSeconds));
 	}
 
 	private static double EstimateNarrationSeconds(string text, SpeechLanguage language)
@@ -101,12 +101,12 @@ public static class BubblePresentationTiming
 
 	private static double EstimateReadingSeconds(string text)
 	{
-		return (double)CountVisibleCharacters(text) / ReadingCharactersPerSecond;
+		return (double)CountVisibleCharacters(text) / 6.5;
 	}
 
 	private static double EstimateTypingSeconds(string text)
 	{
-		return (double)CountVisibleCharacters(text) / TypingCharactersPerSecond;
+		return (double)CountVisibleCharacters(text) / 25.0;
 	}
 
 	private static int CountVisibleCharacters(string text)

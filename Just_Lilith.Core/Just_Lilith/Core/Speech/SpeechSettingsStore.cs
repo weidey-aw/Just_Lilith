@@ -124,62 +124,78 @@ public sealed class SpeechSettingsStore
 					throw new SpeechException("settings_format", "TTS 配置包含重复字段；文件保持不变。");
 				}
 			}
-			int value2 = default(int);
-			bool flag = !rootElement.TryGetProperty("schema_version", out var value) || value.ValueKind != JsonValueKind.Number || !value.TryGetInt32(out value2);
+			int value = 0;
+			bool flag = !rootElement.TryGetProperty("schema_version", out var value2) || value2.ValueKind != JsonValueKind.Number || !value2.TryGetInt32(out value);
 			if (!flag)
 			{
-				bool flag2 = (uint)(value2 - 1) <= 2u;
-				flag = !flag2;
+				flag = (uint)(value - 1) > 3u;
 			}
 			if (flag)
 			{
 				throw new SpeechException("settings_version", "TTS 配置版本不受支持；文件保持不变。");
 			}
 			HashSet<string> hashSet2 = new HashSet<string>(new string[6] { "schema_version", "enabled", "language", "reactions_enabled", "volume", "service_url" }, StringComparer.Ordinal);
-			if (value2 >= 2)
+			if (value >= 2)
 			{
 				hashSet2.Add("reference_mode");
 				hashSet2.Add("forced_reference_style");
 			}
-			if (value2 == 3)
+			if (value >= 3)
 			{
 				hashSet2.Add("service_enabled");
+			}
+			if (value >= 4)
+			{
+				hashSet2.Add("external_service");
+			}
+			else if (value == 3 && hashSet.Contains("external_service"))
+			{
+				hashSet2.Add("external_service");
 			}
 			if (!hashSet.SetEquals(hashSet2))
 			{
 				throw new SpeechException("settings_format", "TTS 配置字段不完整或包含未知字段；文件保持不变。");
 			}
-			string[] array2 = ((value2 != 3) ? new string[2] { "enabled", "reactions_enabled" } : new string[3] { "enabled", "reactions_enabled", "service_enabled" });
+			string[] array2;
+			if (value >= 3)
+			{
+				array2 = ((value == 4) ? new string[4] { "enabled", "reactions_enabled", "service_enabled", "external_service" } : new string[3] { "enabled", "reactions_enabled", "service_enabled" });
+			}
+			else
+			{
+				array2 = new string[2] { "enabled", "reactions_enabled" };
+			}
 			foreach (string propertyName in array2)
 			{
-				JsonValueKind valueKind = rootElement.GetProperty(propertyName).ValueKind;
-				if (valueKind - 5 > JsonValueKind.Object)
+				if ((int)(rootElement.GetProperty(propertyName).ValueKind - 5) > 1)
 				{
 					throw new SpeechException("settings_format", "TTS 开关字段须为布尔值；文件保持不变。");
 				}
+			}
+			if (rootElement.TryGetProperty("external_service", out var value3) && (int)(value3.ValueKind - 5) > 1)
+			{
+				throw new SpeechException("settings_format", "TTS 开关字段须为布尔值；文件保持不变。");
 			}
 			JsonElement property = rootElement.GetProperty("language");
 			flag = property.ValueKind != JsonValueKind.String;
 			if (!flag)
 			{
 				string text = property.GetString();
-				bool flag2 = ((text == "Chinese" || text == "Japanese") ? true : false);
-				flag = !flag2;
+				flag = (!(text == "Chinese") && !(text == "Japanese")) || 1 == 0;
 			}
 			if (flag || rootElement.GetProperty("volume").ValueKind != JsonValueKind.Number || rootElement.GetProperty("service_url").ValueKind != JsonValueKind.String)
 			{
 				throw new SpeechException("settings_format", "TTS 语言、音量或服务地址字段格式不正确；文件保持不变。");
 			}
-			if (value2 >= 2)
+			if (value >= 2)
 			{
 				JsonElement property2 = rootElement.GetProperty("reference_mode");
 				JsonElement property3 = rootElement.GetProperty("forced_reference_style");
 				flag = property2.ValueKind != JsonValueKind.String;
 				if (!flag)
 				{
-					string text = property2.GetString();
-					bool flag2 = ((text == "Automatic" || text == "Manual") ? true : false);
-					flag = !flag2;
+					string text2 = property2.GetString();
+					flag = (!(text2 == "Automatic") && !(text2 == "Manual")) || 1 == 0;
 				}
 				if (flag || property3.ValueKind != JsonValueKind.String || !SpeechReferenceStyles.IsValid(SpeechReferenceStyles.Canonicalize(property3.GetString())))
 				{
@@ -203,9 +219,7 @@ public sealed class SpeechSettingsStore
 		bool flag = (object)value == null;
 		if (!flag)
 		{
-			int schemaVersion = value.SchemaVersion;
-			bool flag2 = (uint)(schemaVersion - 1) <= 2u;
-			flag = !flag2;
+			flag = (uint)(value.SchemaVersion - 1) > 3u;
 		}
 		if (flag)
 		{
@@ -215,8 +229,7 @@ public sealed class SpeechSettingsStore
 		if (!flag)
 		{
 			float volume = value.Volume;
-			bool flag2 = ((volume < 0f || volume > 1f) ? true : false);
-			flag = flag2;
+			flag = ((volume < 0f || volume > 1f) ? true : false);
 		}
 		if (flag)
 		{
@@ -224,9 +237,9 @@ public sealed class SpeechSettingsStore
 		}
 		return value with
 		{
-			SchemaVersion = 3,
+			SchemaVersion = 4,
 			ForcedReferenceStyle = SpeechReferenceStyles.Canonicalize(value.ForcedReferenceStyle),
-			ServiceEnabled = (value.SchemaVersion == 3 && value.ServiceEnabled),
+			ServiceEnabled = (value.SchemaVersion >= 3 && value.ServiceEnabled),
 			ServiceUrl = SpeechEndpoint.Normalize(value.ServiceUrl)
 		};
 	}

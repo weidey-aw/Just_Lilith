@@ -4,12 +4,14 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using BepInEx.Logging;
+using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using Just_Lilith.Core.Contracts;
 using Just_Lilith.Core.Llm;
 using Just_Lilith.Core.Speech;
 using Just_Lilith.Unity.Game;
 using Just_Lilith.Unity.Ui;
 using UnityEngine;
+using Object = UnityEngine.Object;
 
 namespace Just_Lilith.Unity.Speech;
 
@@ -51,6 +53,12 @@ public sealed class MainThreadSpeechController
 
 	private Task<WorkResult>? _active;
 
+	private Guid _activeMessageId;
+
+	private string? _activeText;
+
+	private readonly TalkActionDriver _talkAction;
+
 	private CancellationTokenSource? _operation;
 
 	private GameObject? _audioObject;
@@ -71,9 +79,21 @@ public sealed class MainThreadSpeechController
 
 	private DateTimeOffset _ignoreBefore = DateTimeOffset.MinValue;
 
+	private bool _deferredEnable;
+
+	private DateTimeOffset _deferredEnableDeadline;
+
+	private DateTimeOffset _syncSeenAt = DateTimeOffset.MaxValue;
+
+	private static readonly TimeSpan DeferredFallbackDelay = TimeSpan.FromSeconds(40.0);
+
+	private static readonly TimeSpan SyncGracePeriod = TimeSpan.FromSeconds(20.0);
+
 	private string _status = "正在载入 TTS 服务偏好；首次默认关闭。";
 
 	public SpeechSettings Settings { get; private set; } = new SpeechSettings();
+
+	internal bool SettingsLoaded => _loaded;
 
 	public long Generation => Volatile.Read(ref _generation);
 
@@ -89,6 +109,35 @@ public sealed class MainThreadSpeechController
 		}
 	}
 
+	internal bool SpeechActive
+	{
+		get
+		{
+			if (_active != null)
+			{
+				return true;
+			}
+			AudioSource audio = _audio;
+			if ((Object)(object)audio != (Object)null && audio.isPlaying)
+			{
+				return true;
+			}
+			lock (_pending)
+			{
+				return _pending.Count > 0;
+			}
+		}
+	}
+
+	internal void SpeakVoiceOnly(string text, SpeechLanguage language)
+	{
+		if (CanSpeak && !string.IsNullOrWhiteSpace(text))
+		{
+			Enqueue(new PendingSpeech(new SpeechSynthesisRequest(Guid.NewGuid(), text, language, new SpeechDirective()), DateTimeOffset.UtcNow, _generation));
+			_log.LogInfo((object)("module=VoiceFallback; event=queued; len=" + text.Length));
+		}
+	}
+
 	internal MainThreadSpeechController(LlmGameBridge bridge, LlmConfigurationView view, string settingsPath, ManualLogSource log, ITtsServiceManager service)
 	{
 		_bridge = bridge;
@@ -96,6 +145,7 @@ public sealed class MainThreadSpeechController
 		_store = new SpeechSettingsStore(settingsPath);
 		_log = log;
 		_service = service;
+		_talkAction = new TalkActionDriver(log);
 	}
 
 	public bool IsCurrentGeneration(long generation)
@@ -112,11 +162,11 @@ public sealed class MainThreadSpeechController
 		_view.InitializeSpeech(new SpeechUiCallbacks
 		{
 			SelectServiceEnabled = SelectServiceEnabled,
-			SelectLanguage = delegate(SpeechLanguage language)
+			SelectLanguage = (SpeechLanguage language) =>
 			{
 				Change(SpeechRadioSelection.WithLanguage(Settings, language));
 			},
-			SelectReference = delegate(string? style)
+			SelectReference = (string? style) =>
 			{
 				Change(SpeechRadioSelection.WithReference(Settings, style));
 			}
@@ -131,6 +181,7 @@ public sealed class MainThreadSpeechController
 		{
 			return;
 		}
+		_talkAction.Tick(Time.unscaledTime);
 		if (Volatile.Read(ref _stopped) != 0)
 		{
 			ShutdownFromMainThread(applicationQuitting: false);
@@ -148,8 +199,18 @@ public sealed class MainThreadSpeechController
 			{
 				Settings = _loading.GetAwaiter().GetResult();
 				_loaded = true;
-				_service.SetEnabled(Settings.ServiceEnabled, Settings.ServiceUrl);
-				RefreshServiceState(force: true);
+				if (Settings.Enabled && Settings.ServiceEnabled)
+				{
+					_deferredEnable = true;
+					_deferredEnableDeadline = DateTimeOffset.UtcNow + DeferredFallbackDelay;
+					_lastServiceState = _service.State;
+					SetStatus("语音服务将在人物出场后自动开启（避免启动卡顿）；之前跟她说话，语音会等它就绪后补上。");
+				}
+				else
+				{
+					_service.SetEnabled(enabled: false, Settings.ServiceUrl, Settings.ExternalService);
+					RefreshServiceState(force: true);
+				}
 			}
 			catch (Exception error)
 			{
@@ -164,36 +225,92 @@ public sealed class MainThreadSpeechController
 			_loading = null;
 			Present();
 		}
-		RefreshServiceState();
-		if (_clip != null && _audio != null && !_audio.isPlaying)
+		if (_deferredEnable)
 		{
+			if (GameCharacterProbe.IsCharacterPresent() && _syncSeenAt == DateTimeOffset.MaxValue)
+			{
+				_syncSeenAt = DateTimeOffset.UtcNow;
+			}
+			if ((_syncSeenAt != DateTimeOffset.MaxValue && DateTimeOffset.UtcNow >= _syncSeenAt + SyncGracePeriod) || DateTimeOffset.UtcNow >= _deferredEnableDeadline)
+			{
+				StartDeferredService();
+			}
+		}
+		RefreshServiceState();
+		if ((Object)(object)_clip != (Object)null && (Object)(object)_audio != (Object)null && !_audio.isPlaying)
+		{
+			_bridge.OnSpeechPlaybackFinished(_activeMessageId);
+			_talkAction.Finish();
 			ReleaseClip();
 			SetStatus("播放完成；等待下一条已显示的气泡。");
 		}
 		OrdinaryChatOutput output;
 		while (_bridge.TryDequeueTtsText(out output))
 		{
-			if (!CanSpeak || output.CreatedAt < _ignoreBefore)
+			if (output.CreatedAt < _ignoreBefore)
 			{
+				ManualLogSource log = _log;
+				if (log != null)
+				{
+					log.LogInfo((object)("module=SpeechDiag; source=controller; event=dequeued_but_skipped; can_speak=" + (CanSpeak ? "1" : "0") + "; too_old=1; phase=" + _service.State.Phase));
+				}
+				_bridge.OnSpeechPlaybackSkipped(output.MessageId);
 				continue;
+			}
+			if (!CanSpeak)
+			{
+				if (output.SpeechDiagnostic == null && output.SpeechEnabled && output.SpeechLanguage == Settings.Language && _loaded && Settings.Enabled && Settings.ServiceEnabled && (_deferredEnable || _service.State.Phase == TtsServicePhase.Starting))
+				{
+					if (_deferredEnable)
+					{
+						StartDeferredService();
+					}
+					SpeechDirective speechDirective = SpeechReferenceSelection.Resolve(output.Speech, Settings);
+					SpeechDirective directive = (Settings.ReactionsEnabled ? speechDirective : speechDirective with
+					{
+						ReactionId = null
+					});
+					Enqueue(new PendingSpeech(new SpeechSynthesisRequest(output.MessageId, output.TtsText, output.SpeechLanguage, directive), output.CreatedAt, _generation));
+				}
+				else
+				{
+					ManualLogSource log2 = _log;
+					if (log2 != null)
+					{
+						log2.LogInfo((object)("module=SpeechDiag; source=controller; event=dequeued_but_skipped; can_speak=" + (CanSpeak ? "1" : "0") + "; too_old=0; phase=" + _service.State.Phase));
+					}
+					_bridge.OnSpeechPlaybackSkipped(output.MessageId);
+				}
+				continue;
+			}
+			ManualLogSource log3 = _log;
+			if (log3 != null)
+			{
+				log3.LogInfo((object)("module=SpeechDiag; source=controller; event=dequeued_ok; speech_enabled=" + (output.SpeechEnabled ? "1" : "0") + "; lang_match=" + ((output.SpeechLanguage == Settings.Language) ? "1" : "0") + "; diagnostic=" + (output.SpeechDiagnostic ?? "<null>") + "; tts_len=" + ((output.TtsText == null) ? (-1) : output.TtsText.Length)));
 			}
 			if (output.SpeechDiagnostic != null)
 			{
 				SetStatus("本轮语音未生成：" + output.SpeechDiagnostic + "；文字已保留。");
+				_bridge.OnSpeechPlaybackSkipped(output.MessageId);
 			}
 			else if (output.SpeechEnabled && output.SpeechLanguage == Settings.Language)
 			{
 				if (DateTimeOffset.UtcNow - output.CreatedAt > MaximumAge)
 				{
 					Expired("气泡等待已超过 45 秒");
+					_bridge.OnSpeechPlaybackSkipped(output.MessageId);
 					continue;
 				}
-				SpeechDirective speechDirective = SpeechReferenceSelection.Resolve(output.Speech, Settings);
-				SpeechDirective directive = (Settings.ReactionsEnabled ? speechDirective : speechDirective with
+				SpeechDirective speechDirective2 = SpeechReferenceSelection.Resolve(output.Speech, Settings);
+				SpeechDirective directive2 = (Settings.ReactionsEnabled ? speechDirective2 : speechDirective2 with
 				{
 					ReactionId = null
 				});
-				Enqueue(new PendingSpeech(new SpeechSynthesisRequest(output.MessageId, output.TtsText, output.SpeechLanguage, directive), output.CreatedAt, _generation));
+				Enqueue(new PendingSpeech(new SpeechSynthesisRequest(output.MessageId, output.TtsText, output.SpeechLanguage, directive2), output.CreatedAt, _generation));
+			}
+			else if (output.SpeechEnabled)
+			{
+				_bridge.OnSpeechPlaybackSkipped(output.MessageId);
 			}
 		}
 		Task<WorkResult> active = _active;
@@ -206,6 +323,7 @@ public sealed class MainThreadSpeechController
 			{
 				if (result2.Error != null)
 				{
+					_bridge.OnSpeechPlaybackSkipped(_activeMessageId);
 					Fail(result2.Error);
 				}
 				else if ((object)result2.Wave != null)
@@ -213,16 +331,18 @@ public sealed class MainThreadSpeechController
 					try
 					{
 						Play(result2.Wave);
+						_bridge.OnSpeechPlaybackStarted(_activeMessageId);
 					}
 					catch (Exception error2)
 					{
 						ReleaseClip();
+						_bridge.OnSpeechPlaybackSkipped(_activeMessageId);
 						Fail(error2);
 					}
 				}
 			}
 		}
-		if (_active != null || !(_clip == null) || !CanSpeak)
+		if (_active != null || !((Object)(object)_clip == (Object)null) || !CanSpeak)
 		{
 			return;
 		}
@@ -235,6 +355,8 @@ public sealed class MainThreadSpeechController
 				{
 					_operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
 					_active = RunSynthesis(pendingSpeech, Settings.ServiceUrl, _operation);
+					_activeMessageId = pendingSpeech.Request.RequestId;
+					_activeText = pendingSpeech.Request.Text;
 					SetStatus("正在合成" + ((pendingSpeech.Request.Language == SpeechLanguage.Japanese) ? "日语" : "中文") + "语音；首次切换需载入对应模型，文字已保留。");
 					break;
 				}
@@ -247,15 +369,16 @@ public sealed class MainThreadSpeechController
 	{
 		_expiredCount++;
 		SetStatus(reason + "，本条已丢弃；文字与会话保持不变。");
-		_log.LogInfo("module=TTS; event=stale_voice_discarded; total=" + _expiredCount);
+		_log.LogInfo((object)("module=TTS; event=stale_voice_discarded; total=" + _expiredCount));
 	}
 
 	private void Enqueue(PendingSpeech next)
 	{
 		if (_pending.Count >= 3)
 		{
-			_pending.Dequeue();
-			_log.LogInfo("module=TTS; event=backlog_trimmed; text_logged=false");
+			PendingSpeech pendingSpeech = _pending.Dequeue();
+			_bridge.OnSpeechPlaybackSkipped(pendingSpeech.Request.RequestId);
+			_log.LogInfo((object)"module=TTS; event=backlog_trimmed; text_logged=false");
 		}
 		_pending.Enqueue(next);
 	}
@@ -265,7 +388,7 @@ public sealed class MainThreadSpeechController
 		try
 		{
 			using LocalTtsClient client = new LocalTtsClient(serviceUrl);
-			PcmWaveData wave = await client.SynthesizeAsync(next.Request, cancellation.Token).ConfigureAwait(continueOnCapturedContext: false);
+			PcmWaveData wave = await SpeechSplitSynthesizer.SynthesizeAsync(client, next.Request, cancellation.Token).ConfigureAwait(continueOnCapturedContext: false);
 			return new WorkResult(next.Generation, next.CreatedAt, wave, null);
 		}
 		catch (Exception error)
@@ -280,16 +403,18 @@ public sealed class MainThreadSpeechController
 
 	private void Play(PcmWaveData wave)
 	{
-		if (_audioObject == null)
+		//IL_0014: Unknown result type (might be due to invalid IL or missing references)
+		//IL_001e: Expected Obj, but got Unknown
+		if ((Object)(object)_audioObject == (Object)null)
 		{
 			_audioObject = new GameObject("Just_Lilith.TTS.Audio");
-			UnityEngine.Object.DontDestroyOnLoad(_audioObject);
+			Object.DontDestroyOnLoad((Object)(object)_audioObject);
 			_audio = _audioObject.AddComponent<AudioSource>();
 			_audio.playOnAwake = false;
 			_audio.loop = false;
 			_audio.spatialBlend = 0f;
 		}
-		_clip = AudioClip.Create("Just_Lilith.TTS", wave.SampleFrames, wave.Channels, wave.SampleRate, stream: false);
+		_clip = AudioClip.Create("Just_Lilith.TTS", wave.SampleFrames, wave.Channels, wave.SampleRate, false);
 		if (!_clip.SetData(wave.Samples, 0))
 		{
 			throw new InvalidOperationException("AudioClip.SetData failed.");
@@ -297,6 +422,7 @@ public sealed class MainThreadSpeechController
 		_audio.clip = _clip;
 		_audio.volume = Settings.Volume;
 		_audio.Play();
+		_talkAction.OnSpeechStarted(_activeText ?? "", (float)wave.DurationSeconds);
 		SetStatus("Unity 正在播放：可选反应音 → TTS 正文。");
 	}
 
@@ -315,6 +441,22 @@ public sealed class MainThreadSpeechController
 		}
 	}
 
+	private void StartDeferredService()
+	{
+		if (_deferredEnable)
+		{
+			_deferredEnable = false;
+			_service.SetEnabled(enabled: true, Settings.ServiceUrl, Settings.ExternalService);
+			_lastServiceState = _service.State;
+			SetStatus("语音服务启动中（启动延迟结束）；此前排队的语音会在就绪后补上。");
+			ManualLogSource log = _log;
+			if (log != null)
+			{
+				log.LogInfo((object)("module=TTS; event=deferred_service_started; t=" + Time.unscaledTime.ToString("0.00")));
+			}
+		}
+	}
+
 	private void SelectServiceEnabled(bool enabled)
 	{
 		lock (_preferenceGate)
@@ -323,12 +465,13 @@ public sealed class MainThreadSpeechController
 			{
 				CancelPlayback();
 				SpeechSettings speechSettings = SpeechRadioSelection.WithServiceEnabled(Settings, enabled);
-				bool num = speechSettings != Settings;
+				bool flag = speechSettings != Settings;
 				Settings = speechSettings;
-				_service.SetEnabled(enabled, Settings.ServiceUrl);
+				_deferredEnable = false;
+				_service.SetEnabled(enabled, Settings.ServiceUrl, Settings.ExternalService);
 				_lastServiceState = _service.State;
 				SetStatus(DescribeService(_lastServiceState));
-				if (num)
+				if (flag)
 				{
 					_lastSave = SaveAsync(speechSettings);
 				}
@@ -345,7 +488,7 @@ public sealed class MainThreadSpeechController
 		TtsServiceState state = _service.State;
 		if (force || !(state == _lastServiceState))
 		{
-			TtsServiceState? lastServiceState = _lastServiceState;
+			TtsServiceState lastServiceState = _lastServiceState;
 			if ((object)lastServiceState != null && lastServiceState.Phase == TtsServicePhase.Ready && state.Phase != TtsServicePhase.Ready && Settings.ServiceEnabled)
 			{
 				CancelPlayback();
@@ -389,7 +532,7 @@ public sealed class MainThreadSpeechController
 		catch (Exception error)
 		{
 			LogFailure(error);
-			_mainActions.Enqueue(delegate
+			_mainActions.Enqueue(() =>
 			{
 				SetStatus("语音设置保存失败；当前值仅本次有效，原文件保留。");
 			});
@@ -403,19 +546,20 @@ public sealed class MainThreadSpeechController
 		_pending.Clear();
 		_bridge.ClearPendingSpeech();
 		Cancel(_operation);
+		_talkAction.Finish();
 		ReleaseClip();
 	}
 
 	private void ReleaseClip()
 	{
-		if (_audio != null)
+		if ((Object)(object)_audio != (Object)null)
 		{
 			_audio.Stop();
 			_audio.clip = null;
 		}
-		if (_clip != null)
+		if ((Object)(object)_clip != (Object)null)
 		{
-			UnityEngine.Object.Destroy(_clip);
+			Object.Destroy((Object)(object)_clip);
 		}
 		_clip = null;
 	}
@@ -431,7 +575,7 @@ public sealed class MainThreadSpeechController
 
 	private void LogFailure(Exception error)
 	{
-		_log.LogWarning("module=TTS; event=operation_failed; code=" + ((error is SpeechException ex) ? ex.Code : error.GetType().Name));
+		_log.LogWarning((object)("module=TTS; event=operation_failed; code=" + ((error is SpeechException ex) ? ex.Code : error.GetType().Name)));
 	}
 
 	private void SetStatus(string value)
@@ -458,6 +602,7 @@ public sealed class MainThreadSpeechController
 
 	public void RequestStop()
 	{
+		_talkAction.Finish();
 		Task lastSave;
 		lock (_preferenceGate)
 		{
@@ -472,7 +617,7 @@ public sealed class MainThreadSpeechController
 		_service.RequestStop();
 		if (!lastSave.Wait(TimeSpan.FromSeconds(2.0)))
 		{
-			_log.LogWarning("module=TTS; event=preference_flush_timeout; latest_preference_may_not_be_saved");
+			_log.LogWarning((object)"module=TTS; event=preference_flush_timeout; latest_preference_may_not_be_saved");
 		}
 	}
 
@@ -494,9 +639,9 @@ public sealed class MainThreadSpeechController
 		if (!applicationQuitting)
 		{
 			ReleaseClip();
-			if (_audioObject != null)
+			if ((Object)(object)_audioObject != (Object)null)
 			{
-				UnityEngine.Object.Destroy(_audioObject);
+				Object.Destroy((Object)(object)_audioObject);
 			}
 		}
 		_clip = null;

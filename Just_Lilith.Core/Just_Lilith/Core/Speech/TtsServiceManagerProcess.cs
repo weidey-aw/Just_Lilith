@@ -179,6 +179,10 @@ internal sealed class TtsServiceManagerProcess : ITtsManagedProcess, IDisposable
 		[DllImport("kernel32.dll", SetLastError = true)]
 		[return: MarshalAs(UnmanagedType.Bool)]
 		internal static extern bool GetExitCodeProcess(SafeFileHandle process, out uint code);
+
+		[DllImport("kernel32.dll", SetLastError = true)]
+		[return: MarshalAs(UnmanagedType.Bool)]
+		internal static extern bool SetPriorityClass(SafeFileHandle process, uint priorityClass);
 	}
 
 	private readonly object gate = new object();
@@ -319,6 +323,8 @@ internal sealed class TtsServiceManagerProcess : ITtsManagedProcess, IDisposable
 		SafeFileHandle write = null;
 		SafeFileHandle read2 = null;
 		SafeFileHandle write2 = null;
+		SafeFileHandle read3 = null;
+		SafeFileHandle write3 = null;
 		SafeFileHandle safeFileHandle = null;
 		SafeFileHandle safeFileHandle2 = null;
 		IntPtr intPtr = IntPtr.Zero;
@@ -332,11 +338,9 @@ internal sealed class TtsServiceManagerProcess : ITtsManagedProcess, IDisposable
 			Check(Native.CreatePipe(out read2, out write2, ref attributes, 0u));
 			Check(Native.SetHandleInformation(read, 1u, 0u));
 			Check(Native.SetHandleInformation(read2, 1u, 0u));
-			safeFileHandle = Native.CreateFile("NUL", 2147483648u, 3u, ref attributes, 3u, 0u, IntPtr.Zero);
-			if (safeFileHandle.IsInvalid)
-			{
-				ThrowNative();
-			}
+			Check(Native.CreatePipe(out read3, out write3, ref attributes, 0u));
+			Check(Native.SetHandleInformation(write3, 1u, 0u));
+			safeFileHandle = read3;
 			safeFileHandle2 = Native.CreateJobObject(IntPtr.Zero, null);
 			if (safeFileHandle2.IsInvalid)
 			{
@@ -395,6 +399,10 @@ internal sealed class TtsServiceManagerProcess : ITtsManagedProcess, IDisposable
 				using SafeFileHandle thread = new SafeFileHandle(processInformation.Thread, ownsHandle: true);
 				pid = (int)processInformation.ProcessId;
 				started = true;
+				if (!Native.SetPriorityClass(process, 16384u))
+				{
+					log("lifecycle: priority=below_normal; ok=0; err=" + Marshal.GetLastWin32Error());
+				}
 				if (Native.ResumeThread(thread) == uint.MaxValue)
 				{
 					int lastWin32Error = Marshal.GetLastWin32Error();
@@ -417,7 +425,8 @@ internal sealed class TtsServiceManagerProcess : ITtsManagedProcess, IDisposable
 			stderrPump = PumpAsync(stderr, "stderr");
 			Action<string> action = log;
 			int? num = pid;
-			action("lifecycle: process_started; pid=" + num);
+			int? num2 = num;
+			action("lifecycle: process_started; pid=" + num2);
 		}
 		finally
 		{
@@ -425,6 +434,8 @@ internal sealed class TtsServiceManagerProcess : ITtsManagedProcess, IDisposable
 			write?.Dispose();
 			read2?.Dispose();
 			write2?.Dispose();
+			read3?.Dispose();
+			write3?.Dispose();
 			safeFileHandle?.Dispose();
 			safeFileHandle2?.Dispose();
 			if (flag)
@@ -483,7 +494,7 @@ internal sealed class TtsServiceManagerProcess : ITtsManagedProcess, IDisposable
 				for (int i = 0; i < num; i++)
 				{
 					char c = buffer[i];
-					if ((c == '\n' || c == '\r') ? true : false)
+					if (((c == '\n' || c == '\r') ? 1 : 0) != 0)
 					{
 						Emit();
 					}

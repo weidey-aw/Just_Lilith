@@ -6,5 +6,7 @@ public interface ITtsServiceManager
 
 	void SetEnabled(bool enabled, string serviceUrl);
 
+	void SetEnabled(bool enabled, string serviceUrl, bool allowExternal);
+
 	void RequestStop();
 }

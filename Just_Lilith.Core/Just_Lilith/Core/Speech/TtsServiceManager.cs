@@ -57,6 +57,8 @@ public sealed class TtsServiceManager : ITtsServiceManager, IDisposable
 
 	private string endpoint = "";
 
+	private bool externalMode;
+
 	public TtsServiceState State
 	{
 		get
@@ -107,6 +109,11 @@ public sealed class TtsServiceManager : ITtsServiceManager, IDisposable
 
 	public void SetEnabled(bool value, string serviceUrl)
 	{
+		SetEnabled(value, serviceUrl, allowExternal: false);
+	}
+
+	public void SetEnabled(bool value, string serviceUrl, bool allowExternal)
+	{
 		string url = "";
 		bool flag = false;
 		if (value)
@@ -125,12 +132,13 @@ public sealed class TtsServiceManager : ITtsServiceManager, IDisposable
 		Task previous;
 		lock (gate)
 		{
-			if (stopped || (value == enabled && (!value || endpoint == url) && (!value || state.Phase != TtsServicePhase.Failed)))
+			if (stopped || (value == enabled && (!value || endpoint == url) && (!value || externalMode == allowExternal) && (!value || state.Phase != TtsServicePhase.Failed)))
 			{
 				return;
 			}
 			enabled = value;
 			endpoint = url;
+			externalMode = allowExternal;
 			long revision = ++generation;
 			cancellationTokenSource = runCancellation;
 			ttsManagedProcess = owned;
@@ -141,7 +149,7 @@ public sealed class TtsServiceManager : ITtsServiceManager, IDisposable
 				CancellationTokenSource cancellation = new CancellationTokenSource();
 				runCancellation = cancellation;
 				state = ((owned != null) ? new TtsServiceState(TtsServicePhase.Stopping, "正在等待先前 TTS 服务退出", Owned: true) : new TtsServiceState(TtsServicePhase.Starting, "TTS 服务启动中"));
-				worker = Task.Run(async delegate
+				worker = Task.Run(async () =>
 				{
 					try
 					{
@@ -163,7 +171,7 @@ public sealed class TtsServiceManager : ITtsServiceManager, IDisposable
 					}
 					if (!cancellation.IsCancellationRequested)
 					{
-						await RunAsync(revision, url, cancellation.Token).ConfigureAwait(continueOnCapturedContext: false);
+						await RunAsync(revision, url, allowExternal, cancellation.Token).ConfigureAwait(continueOnCapturedContext: false);
 					}
 				});
 			}
@@ -206,7 +214,17 @@ public sealed class TtsServiceManager : ITtsServiceManager, IDisposable
 		{
 			if (generation == revision)
 			{
-				state = ((owned != null) ? new TtsServiceState(TtsServicePhase.Stopping, "TTS 服务退出尚未确认，请查看诊断日志", Owned: true) : (failed ? new TtsServiceState(TtsServicePhase.Failed, "TTS 服务地址须为本机 127.0.0.1 的有效端口") : new TtsServiceState(TtsServicePhase.Off, "TTS 服务已关闭")));
+				ref TtsServiceState reference = ref state;
+				TtsServiceState ttsServiceState;
+				if (owned != null)
+				{
+					ttsServiceState = new TtsServiceState(TtsServicePhase.Stopping, "TTS 服务退出尚未确认，请查看诊断日志", Owned: true);
+				}
+				else
+				{
+					ttsServiceState = (failed ? new TtsServiceState(TtsServicePhase.Failed, "TTS 服务地址须为本机 127.0.0.1 的有效端口") : new TtsServiceState(TtsServicePhase.Off, "TTS 服务已关闭"));
+				}
+				reference = ttsServiceState;
 			}
 		}
 	}
@@ -278,7 +296,7 @@ public sealed class TtsServiceManager : ITtsServiceManager, IDisposable
 		}
 	}
 
-	private async Task RunAsync(long revision, string url, CancellationToken cancellation)
+	private async Task RunAsync(long revision, string url, bool allowExternal, CancellationToken cancellation)
 	{
 		ITtsManagedProcess child = null;
 		TtsServiceManagerDiagnostics diagnostics = null;
@@ -293,8 +311,8 @@ public sealed class TtsServiceManager : ITtsServiceManager, IDisposable
 				string runtime = Path.GetFullPath(options.RuntimeDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
 				TtsServiceManagerProcess.AssertPlainPath(runtime);
 				diagnostics = new TtsServiceManagerDiagnostics(runtime);
-				Publish(revision, TtsServicePhase.Starting, "TTS 服务启动中");
-				Log("lifecycle: attempt_started; generation=" + revision + "; endpoint=" + url);
+				Publish(revision, TtsServicePhase.Starting, allowExternal ? "外部 TTS 连接中" : "TTS 服务启动中");
+				Log("lifecycle: attempt_started; generation=" + revision + "; endpoint=" + url + "; external=" + allowExternal);
 				string project = ProjectIdentity(runtime);
 				using SocketsHttpHandler handler = new SocketsHttpHandler
 				{
@@ -308,23 +326,36 @@ public sealed class TtsServiceManager : ITtsServiceManager, IDisposable
 				};
 				Uri uri = new Uri(url);
 				Stopwatch startupClock = Stopwatch.StartNew();
-				Health health = await ProbeAsync(http, uri, project, null, cancellation).ConfigureAwait(continueOnCapturedContext: false);
+				Health health = await ProbeAsync(http, uri, project, null, allowExternal, cancellation).ConfigureAwait(continueOnCapturedContext: false);
 				Log("lifecycle: initial_health=" + health);
 				if (!IsCurrent(revision, cancellation))
 				{
 					return;
 				}
-				if ((uint)(health - 3) <= 1u)
+				switch (health)
 				{
+				case Health.Failed:
+				case Health.Unknown:
+					if (allowExternal)
+					{
+						throw new ServiceFailure((health == Health.Unknown) ? "外部 TTS 健康检查格式不正确：/health 需返回 JSON，status 为 ready/loading/error" : "外部 TTS 返回错误状态（status=error）");
+					}
 					throw new ServiceFailure((health == Health.Unknown) ? "端口已占用或服务身份未确认" : "TTS 服务模型加载失败");
-				}
-				if ((uint)(health - 1) <= 1u)
-				{
-					throw new ServiceFailure("检测到外部 TTS 实例；请先停止手动服务再开启，本插件未接管");
+				case Health.Loading:
+				case Health.Ready:
+					if (!allowExternal)
+					{
+						throw new ServiceFailure("检测到外部 TTS 实例；请先停止手动服务再开启，本插件未接管");
+					}
+					break;
 				}
 				if (health != Health.Missing)
 				{
-					goto IL_03dd;
+					goto IL_044b;
+				}
+				if (allowExternal)
+				{
+					throw new ServiceFailure("外部 TTS 未启动：请先在 " + url + " 启动你的 TTS 服务");
 				}
 				child = options.ProcessFactory?.Invoke(runtime, uri.Port, token, Log) ?? new TtsServiceManagerProcess(runtime, uri.Port, token, Log);
 				lock (gate)
@@ -334,13 +365,9 @@ public sealed class TtsServiceManager : ITtsServiceManager, IDisposable
 						return;
 					}
 					owned = child;
-					goto IL_03ba;
+					goto IL_0428;
 				}
-				IL_03ba:
-				child.Start();
-				Publish(revision, TtsServicePhase.Starting, "TTS 服务启动中", isOwned: true);
-				goto IL_03dd;
-				IL_03dd:
+				IL_044b:
 				bool ready = false;
 				int missed = 0;
 				while (IsCurrent(revision, cancellation))
@@ -351,7 +378,7 @@ public sealed class TtsServiceManager : ITtsServiceManager, IDisposable
 						string text = exitCode.ToString();
 						uint num = (uint)exitCode;
 						Log("lifecycle: unexpected_exit; exit_code=" + text + "; exit_hex=0x" + num.ToString("X8"));
-						string[] obj = new string[5]
+						string[] array = new string[5]
 						{
 							"TTS 服务进程已退出（",
 							exitCode.ToString(),
@@ -360,48 +387,56 @@ public sealed class TtsServiceManager : ITtsServiceManager, IDisposable
 							null
 						};
 						num = (uint)exitCode;
-						obj[3] = num.ToString("X8");
-						obj[4] = "）";
-						throw new ServiceFailure(string.Concat(obj));
+						array[3] = num.ToString("X8");
+						array[4] = "）";
+						throw new ServiceFailure(string.Concat(array));
 					}
-					Health health2 = await ProbeAsync(http, uri, project, (child == null) ? null : token, cancellation).ConfigureAwait(continueOnCapturedContext: false);
+					Health health2 = await ProbeAsync(http, uri, project, (child == null) ? null : token, allowExternal, cancellation).ConfigureAwait(continueOnCapturedContext: false);
 					if (!IsCurrent(revision, cancellation))
 					{
 						return;
 					}
-					if (health2 == Health.Ready)
+					switch (health2)
 					{
+					case Health.Ready:
 						missed = 0;
 						if (!ready)
 						{
 							ready = true;
-							Log("lifecycle: ready; owned=True");
-							Publish(revision, TtsServicePhase.Ready, "TTS 服务已就绪", isOwned: true);
+							Log("lifecycle: ready; owned=" + (child != null));
+							Publish(revision, TtsServicePhase.Ready, allowExternal ? "外部 TTS 已就绪" : "TTS 服务已就绪", child != null);
 						}
-					}
-					else
-					{
-						if ((uint)(health2 - 3) <= 1u)
+						break;
+					case Health.Failed:
+					case Health.Unknown:
+						if (allowExternal)
 						{
-							throw new ServiceFailure((health2 == Health.Unknown) ? "TTS 服务身份或端口冲突" : "TTS 服务模型加载失败");
+							throw new ServiceFailure((health2 == Health.Unknown) ? "外部 TTS 健康检查格式不正确：/health 需返回 JSON，status 为 ready/loading/error" : "外部 TTS 返回错误状态（status=error）");
 						}
+						throw new ServiceFailure((health2 == Health.Unknown) ? "TTS 服务身份或端口冲突" : "TTS 服务模型加载失败");
+					default:
 						if (ready)
 						{
 							int num2 = missed + 1;
 							missed = num2;
 							if (num2 >= 3)
 							{
-								throw new ServiceFailure("TTS 服务连接已中断");
+								throw new ServiceFailure(allowExternal ? "外部 TTS 连接已中断（服务可能已退出）" : "TTS 服务连接已中断");
 							}
 						}
+						break;
 					}
 					if (!ready && startupClock.Elapsed >= options.StartupTimeout)
 					{
-						throw new ServiceFailure("TTS 服务启动超时");
+						throw new ServiceFailure(allowExternal ? "外部 TTS 启动超时（/health 一直不是 ready）" : "TTS 服务启动超时");
 					}
 					await Task.Delay(options.HealthPollInterval, cancellation).ConfigureAwait(continueOnCapturedContext: false);
 				}
 				goto end_IL_009e;
+				IL_0428:
+				child.Start();
+				Publish(revision, TtsServicePhase.Starting, "TTS 服务启动中", isOwned: true);
+				goto IL_044b;
 			}
 			catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
 			{
@@ -463,7 +498,7 @@ public sealed class TtsServiceManager : ITtsServiceManager, IDisposable
 					Log("lifecycle: drain_error=" + ex5.GetType().Name);
 				}
 				int exitCode2 = child.ExitCode;
-				string[] obj2 = new string[8]
+				string[] array2 = new string[8]
 				{
 					"lifecycle: child_retired; exit_confirmed=",
 					exitConfirmed.ToString(),
@@ -474,11 +509,11 @@ public sealed class TtsServiceManager : ITtsServiceManager, IDisposable
 					null,
 					null
 				};
-				uint num = (uint)exitCode2;
-				obj2[5] = num.ToString("X8");
-				obj2[6] = "; pipe_drain_completed=";
-				obj2[7] = ready.ToString();
-				Log(string.Concat(obj2));
+				uint num3 = (uint)exitCode2;
+				array2[5] = num3.ToString("X8");
+				array2[6] = "; pipe_drain_completed=";
+				array2[7] = ready.ToString();
+				Log(string.Concat(array2));
 				if (exitConfirmed)
 				{
 					child.Dispose();
@@ -511,7 +546,7 @@ public sealed class TtsServiceManager : ITtsServiceManager, IDisposable
 		}
 	}
 
-	private async Task<Health> ProbeAsync(HttpClient http, Uri endpointUri, string project, string? instance, CancellationToken cancellation)
+	private async Task<Health> ProbeAsync(HttpClient http, Uri endpointUri, string project, string? instance, bool allowExternal, CancellationToken cancellation)
 	{
 		using CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
 		timeout.CancelAfter(options.HealthRequestTimeout);
@@ -529,21 +564,19 @@ public sealed class TtsServiceManager : ITtsServiceManager, IDisposable
 			using Stream stream = await response.Content.ReadAsStreamAsync(timeout.Token).ConfigureAwait(continueOnCapturedContext: false);
 			byte[] bytes = new byte[8193];
 			int count = 0;
-			int read = default(int);
+			int num = 0;
 			while (true)
 			{
-				bool readMore = count < bytes.Length;
-				if (readMore)
+				bool flag = count < bytes.Length;
+				if (flag)
 				{
-					int num;
-					read = (num = await stream.ReadAsync(bytes.AsMemory(count), timeout.Token).ConfigureAwait(continueOnCapturedContext: false));
-					readMore = num > 0;
+					flag = (num = await stream.ReadAsync(bytes.AsMemory(count), timeout.Token).ConfigureAwait(continueOnCapturedContext: false)) > 0;
 				}
-				if (!readMore)
+				if (!flag)
 				{
 					break;
 				}
-				count += read;
+				count += num;
 			}
 			if (count > 8192)
 			{
@@ -553,9 +586,9 @@ public sealed class TtsServiceManager : ITtsServiceManager, IDisposable
 			JsonElement rootElement = jsonDocument.RootElement;
 			if (Text(rootElement, "service") != "Just_Lilith.TTS" || Text(rootElement, "project_id") != project || Text(rootElement, "model_version") != "v4" || !Flag(rootElement, "gpu_only") || (instance != null && Text(rootElement, "instance_token") != instance))
 			{
-				return Health.Unknown;
+				return allowExternal ? ExternalHealth(rootElement) : Health.Unknown;
 			}
-			bool flag;
+			bool flag2;
 			switch (Text(rootElement, "status"))
 			{
 			case "error":
@@ -564,13 +597,13 @@ public sealed class TtsServiceManager : ITtsServiceManager, IDisposable
 				return (Text(rootElement, "device") == "cuda" && Flag(rootElement, "model_loaded")) ? Health.Ready : Health.Failed;
 			case "starting":
 			case "loading":
-				flag = true;
+				flag2 = true;
 				break;
 			default:
-				flag = false;
+				flag2 = false;
 				break;
 			}
-			return flag ? Health.Loading : Health.Unknown;
+			return flag2 ? Health.Loading : Health.Unknown;
 		}
 		catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
 		{
@@ -585,6 +618,22 @@ public sealed class TtsServiceManager : ITtsServiceManager, IDisposable
 	private static bool HasLocalListener(int port)
 	{
 		return IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners().Any((IPEndPoint listener) => listener.Port == port && (listener.Address.Equals(IPAddress.Loopback) || listener.Address.Equals(IPAddress.Any) || listener.Address.Equals(IPAddress.IPv6Any)));
+	}
+
+	private static Health ExternalHealth(JsonElement root)
+	{
+		switch (Text(root, "status"))
+		{
+		case "ready":
+			return Health.Ready;
+		case "starting":
+		case "loading":
+			return Health.Loading;
+		case "error":
+			return Health.Failed;
+		default:
+			return Health.Unknown;
+		}
 	}
 
 	private static string Text(JsonElement root, string name)
@@ -613,13 +662,12 @@ public sealed class TtsServiceManager : ITtsServiceManager, IDisposable
 
 	private static string NormalizeEndpoint(string value)
 	{
-		Uri result = default(Uri);
+		Uri result = null;
 		bool flag = string.IsNullOrWhiteSpace(value) || value.Length > 2048 || value.Any(char.IsControl) || value.Contains('\\') || !Uri.TryCreate(value, UriKind.Absolute, out result) || result.Scheme != "http" || result.UserInfo.Length > 0 || result.Query.Length > 0 || result.Fragment.Length > 0 || result.AbsolutePath != "/";
 		if (!flag)
 		{
 			int port = result.Port;
-			bool flag2 = ((port < 1024 || port > 65535) ? true : false);
-			flag = flag2;
+			flag = ((port < 1024 || port > 65535) ? true : false);
 		}
 		if (flag || (result.Host != "127.0.0.1" && !result.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase)))
 		{
