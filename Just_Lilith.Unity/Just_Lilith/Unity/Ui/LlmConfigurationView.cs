@@ -11,6 +11,7 @@ using Just_Lilith.Core.Contracts;
 using Just_Lilith.Core.Llm;
 using Just_Lilith.Core.Speech;
 using Just_Lilith.Unity.Game;
+using Just_Lilith.Unity.Proactive;
 using Just_Lilith.Unity.Speech;
 using UnityEngine;
 using UnityEngine.EventSystems;
@@ -350,6 +351,11 @@ public sealed class LlmConfigurationView : MonoBehaviour
 	private const int NativeSpeechLanguageTabValue = 3;
 
 	private MainThreadSpeechController? _speechController;
+
+	private ProactiveChatService? _proactive;
+
+	/// <summary>聊天输入框是否正拿着焦点：主动对话投放闸门要用（用户在打字就别插嘴）。</summary>
+	internal bool IsChatInputFocused => _chatInput != null && _chatInput.isFocused;
 
 	private SpeechUiCallbacks _speechCallbacks = new SpeechUiCallbacks();
 
@@ -795,6 +801,7 @@ public sealed class LlmConfigurationView : MonoBehaviour
 				}
 				_gameBridge?.Update();
 				_speechController?.Update();
+				_proactive?.Update();
 				MaintainNativeApiTab();
 				MaintainNativeLilithSpeech();
 				MaintainNativeAgent();
@@ -1650,6 +1657,8 @@ public sealed class LlmConfigurationView : MonoBehaviour
 			_lastChatSubmitFrame = Time.frameCount;
 			_chatFocusPendingUntil = 0f;
 			SafeLogInfo($"module=UI; state=chat_submit_requested; source={source}; characters={_chatInput.text.Length}");
+			// 用户一开口，主动对话的兴趣值/次数/暂存全部清零。
+			_proactive?.NotifyUserMessage();
 			_callbacks.SendRequested?.Invoke(_chatInput.text);
 		}
 	}
@@ -2952,6 +2961,12 @@ public sealed class LlmConfigurationView : MonoBehaviour
 	internal void AttachSpeechController(MainThreadSpeechController controller)
 	{
 		_speechController = controller;
+	}
+
+	[HideFromIl2Cpp]
+	internal void AttachProactiveChat(ProactiveChatService service)
+	{
+		_proactive = service;
 	}
 
 	[HideFromIl2Cpp]

@@ -1372,6 +1372,153 @@ public sealed class LlmConfigurationController : IDisposable
 		_view.SetBusy(_connectionBusy, _chatBusy, _busyProfileId);
 	}
 
+	/// <summary>是否正在生成（主动对话投放前要先问这个，避免两边同时写历史）。</summary>
+	internal bool IsGenerating => _chatBusy;
+
+	/// <summary>
+	/// 主动对话的生成入口：复用 <see cref="SendAsync"/> 的那套"载入会话 → 拼上下文 → 请求 → 解析 → 落盘 → 发布"，
+	/// 但有三处不同：<b>不写 user 消息</b>（用 <see cref="ConversationContextBuilder.BuildProactive"/>）、
+	/// 落盘用 <see cref="ActiveConversationWorkspaceStore.AppendAmbientTurn"/>、<b>不调 _view.SetReply</b>。
+	/// 失败只记日志（<c>module=Proactive; event=skipped</c>），不弹窗、不写 UI 错误。
+	/// <paramref name="onDone"/> 保证在主线程之外被恰好调用一次。
+	/// </summary>
+	internal void SendProactive(string instruction, Action<bool> onDone)
+	{
+		if (Volatile.Read(ref _stopped) != 0 || _chatBusy || _connectionBusy)
+		{
+			LogProactiveSkipped("busy");
+			Complete(onDone, false);
+			return;
+		}
+		if (string.IsNullOrWhiteSpace(instruction))
+		{
+			LogProactiveSkipped("empty_instruction");
+			Complete(onDone, false);
+			return;
+		}
+		LlmProfileSettings activeProfile = _settings.ActiveProfile;
+		if (!activeProfile.IsConfigured)
+		{
+			LogProactiveSkipped("unconfigured");
+			Complete(onDone, false);
+			return;
+		}
+		_chatBusy = true;
+		_chatCommitting = false;
+		_chatCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+		CancellationTokenSource operation = _chatCancellation;
+		long generation = Interlocked.Increment(ref _chatGeneration);
+		UpdateBusy();
+		SendProactiveAsync(activeProfile, _settings.Revision, instruction, generation, operation, onDone);
+	}
+
+	private async Task SendProactiveAsync(LlmProfileSettings profile, long revision, string instruction, long generation, CancellationTokenSource operation, Action<bool> onDone)
+	{
+		bool ok = false;
+		try
+		{
+			try
+			{
+				await _memoryTask.WaitAsync(operation.Token).ConfigureAwait(continueOnCapturedContext: false);
+				(string SystemPrompt, ActiveConversationSnapshot Session, IReadOnlyList<ChatMessage> Messages) context = await Task.Run(delegate
+				{
+					operation.Token.ThrowIfCancellationRequested();
+					string systemPrompt = _conversation.LoadSystemPrompt();
+					// 不在主动路径调 EnsureCanAppend：空 user 会被文本校验挡掉。
+					ActiveConversationSnapshot session = _activeConversation.LoadOrCreate(profile.ProfileId, profile.ModelId, profile.BaseUrl, profile.ProtectedApiKey);
+					IReadOnlyList<ChatMessage> messages = ConversationContextBuilder.BuildProactive(session, instruction);
+					return (SystemPrompt: systemPrompt, Session: session, Messages: messages);
+				}, operation.Token).ConfigureAwait(continueOnCapturedContext: false);
+				SpeechLanguage speechLanguage = _speech?.Settings.Language ?? SpeechLanguage.Chinese;
+				bool speechEnabled = _speech?.CanSpeak ?? false;
+				long speechGeneration = _speech?.Generation ?? 0;
+				ParsedChatReply parsedReply = StructuredChatReply.Parse(await _client.CompleteAsync(profile, context.Messages, StructuredChatReply.BuildSystemPrompt(context.SystemPrompt, speechLanguage), operation.Token, speechLanguage == SpeechLanguage.Japanese, null, null).ConfigureAwait(continueOnCapturedContext: false), speechLanguage);
+				DateTimeOffset receivedAtUtc = DateTimeOffset.UtcNow;
+				ActiveConversationSnapshot saved = await Task.Run(() => _activeConversation.AppendAmbientTurn(context.Session.SessionId, context.Session.Conversation.Revision, parsedReply.Text, receivedAtUtc, context.Session.EventsFingerprint, context.Session.ActivationToken)).ConfigureAwait(continueOnCapturedContext: false);
+				await OnUi(delegate
+				{
+					if (!IsCurrentChat(generation, operation))
+					{
+						return;
+					}
+					try
+					{
+						OrdinaryChatOutput output = new OrdinaryChatOutput(Guid.NewGuid(), profile.ProfileId, revision, profile.ModelId, parsedReply.Text, receivedAtUtc, parsedReply.Speech, speechLanguage, speechEnabled && (_speech?.IsCurrentGeneration(speechGeneration) ?? false), parsedReply.SpeechText, parsedReply.SpeechDiagnostic);
+						_output.Publish(output);
+						_globalStatus = "她主动开口了；这条同样走气泡与 TTS 管线。";
+						SetGlobalStatus(_globalStatus);
+					}
+					catch (Exception ex)
+					{
+						ManualLogSource log = _log;
+						if (log != null)
+						{
+							log.LogWarning("module=Proactive; event=skipped; reason=publish_failed; code=" + ex.GetType().Name);
+						}
+					}
+				}).ConfigureAwait(continueOnCapturedContext: false);
+				LogProactiveCommitted(saved.Conversation.Revision, parsedReply.SpeechDiagnostic);
+				ok = true;
+			}
+			catch (OperationCanceledException)
+			{
+			}
+			catch (LlmException error)
+			{
+				LogProactiveSkipped((error.Code == "model_required") ? "unconfigured" : error.Code);
+			}
+			catch (Exception error2)
+			{
+				LogProactiveSkipped("generate_failed; code=" + error2.GetType().Name);
+			}
+		}
+		finally
+		{
+			_chatBusy = false;
+			_chatCommitting = false;
+			if (_chatCancellation == operation)
+			{
+				_chatCancellation = null;
+			}
+			operation.Dispose();
+			UpdateBusy();
+			Complete(onDone, ok);
+		}
+	}
+
+	private static void Complete(Action<bool> onDone, bool ok)
+	{
+		if (onDone == null)
+		{
+			return;
+		}
+		try
+		{
+			onDone(ok);
+		}
+		catch (Exception)
+		{
+		}
+	}
+
+	private void LogProactiveSkipped(string reason)
+	{
+		ManualLogSource log = _log;
+		if (log != null)
+		{
+			log.LogInfo("module=Proactive; event=skipped; source=idleChat; reason=" + reason + "; text_logged=false");
+		}
+	}
+
+	private void LogProactiveCommitted(long revision, string? speechDiagnostic)
+	{
+		ManualLogSource log = _log;
+		if (log != null)
+		{
+			log.LogInfo("module=Proactive; event=committed; source=idleChat; revision=" + revision + "; ambient=1; user_text=0; speech=" + ((speechDiagnostic == null) ? "ok" : "skipped"));
+		}
+	}
+
 	private bool IsCurrentChat(long generation, CancellationTokenSource operation)
 	{
 		if (generation == Volatile.Read(ref _chatGeneration) && _chatCancellation == operation)

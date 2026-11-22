@@ -146,6 +146,25 @@ internal sealed class LlmGameBridge : IOrdinaryChatOutputSink, IThinkingBubbleSi
 		}
 	}
 
+	/// <summary>
+	/// 是否还有待显示 / 待播报的气泡（主动对话的投放闸门用）。
+	/// 只读，不改任何状态。
+	/// </summary>
+	internal bool IsConversationActive
+	{
+		get
+		{
+			if (Volatile.Read(ref _disposed) != 0)
+			{
+				return false;
+			}
+			lock (_messageGate)
+			{
+				return _thinkingRequested || _bubbleQueue.Count > 0 || _ttsQueue.Count > 0;
+			}
+		}
+	}
+
 	public void Publish(OrdinaryChatOutput output)
 	{
 		ArgumentNullException.ThrowIfNull(output, "output");

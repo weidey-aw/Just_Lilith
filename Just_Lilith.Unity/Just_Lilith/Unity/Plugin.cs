@@ -7,9 +7,11 @@ using BepInEx.Core.Logging.Interpolation;
 using BepInEx.Logging;
 using BepInEx.Unity.IL2CPP;
 using Just_Lilith.Core.Configuration;
+using Just_Lilith.Core.Proactive;
 using Just_Lilith.Core.Speech;
 using Just_Lilith.Core.Threading;
 using Just_Lilith.Unity.Game;
+using Just_Lilith.Unity.Proactive;
 using Just_Lilith.Unity.Speech;
 using Just_Lilith.Unity.Ui;
 
@@ -37,6 +39,8 @@ public sealed class Plugin : BasePlugin
 	private MainThreadSpeechController? _speech;
 
 	private VoiceFallbackService? _voiceFallback;
+
+	private ProactiveChatService? _proactive;
 
 	private CancellationTokenSource? _lifetime;
 
@@ -152,6 +156,17 @@ public sealed class Plugin : BasePlugin
 				_configuration.Initialize();
 				try
 				{
+					_proactive = new ProactiveChatService(_configuration, _view, _gameBridge, _speech, Path.Combine(Paths.ConfigPath, ProactiveSettings.FileName), base.Log);
+					_view.AttachProactiveChat(_proactive);
+				}
+				catch (Exception ex3b)
+				{
+					_proactive?.Dispose();
+					_proactive = null;
+					base.Log.LogWarning("module=Proactive; state=init_failed; chat_preserved=true; code=" + ex3b.GetType().Name);
+				}
+				try
+				{
 					if (_voiceFallback == null)
 					{
 						_voiceFallback = new VoiceFallbackService(_speech, base.Log);
@@ -190,10 +205,12 @@ public sealed class Plugin : BasePlugin
 	public override bool Unload()
 	{
 		_lifetime?.Cancel();
+		_proactive?.Dispose();
 		_speech?.RequestStop();
 		_configuration?.Dispose();
 		_view?.RequestStop();
 		_gameBridge?.Dispose();
+		_proactive = null;
 		_configuration = null;
 		_view = null;
 		_gameBridge = null;
