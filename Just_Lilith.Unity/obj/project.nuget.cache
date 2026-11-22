@@ -1,8 +1,8 @@
 {
   "version": 2,
-  "dgSpecHash": "Kp+uVNj0Ehc=",
+  "dgSpecHash": "0lVx7dCLp7w=",
   "success": true,
-  "projectFilePath": "E:\\_WorkSpace\\Just_Lilith_Original\\Just_Lilith.Unity\\Just_Lilith.Unity.csproj",
+  "projectFilePath": "D:\\Code\\Just_Lilith\\Just_Lilith.Unity\\Just_Lilith.Unity.csproj",
   "expectedPackageFiles": [
     "C:\\Users\\Administrator\\.nuget\\packages\\microsoft.netcore.app.ref\\6.0.36\\microsoft.netcore.app.ref.6.0.36.nupkg.sha512",
     "C:\\Users\\Administrator\\.nuget\\packages\\microsoft.windowsdesktop.app.ref\\6.0.36\\microsoft.windowsdesktop.app.ref.6.0.36.nupkg.sha512",

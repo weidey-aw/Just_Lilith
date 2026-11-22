@@ -11,3 +11,17 @@ E:\_WorkSpace\Just_Lilith_Original\Just_Lilith.Unity\obj\Release\net6.0\Just_Lil
 E:\_WorkSpace\Just_Lilith_Original\Just_Lilith.Unity\obj\Release\net6.0\refint\Just_Lilith.Unity.dll
 E:\_WorkSpace\Just_Lilith_Original\Just_Lilith.Unity\obj\Release\net6.0\Just_Lilith.Unity.pdb
 E:\_WorkSpace\Just_Lilith_Original\Just_Lilith.Unity\obj\Release\net6.0\ref\Just_Lilith.Unity.dll
+D:\Code\Just_Lilith\Just_Lilith.Unity\bin\Release\net6.0\Just_Lilith.Unity.deps.json
+D:\Code\Just_Lilith\Just_Lilith.Unity\bin\Release\net6.0\Just_Lilith.Unity.dll
+D:\Code\Just_Lilith\Just_Lilith.Unity\bin\Release\net6.0\Just_Lilith.Unity.pdb
+D:\Code\Just_Lilith\Just_Lilith.Unity\bin\Release\net6.0\Just_Lilith.Core.dll
+D:\Code\Just_Lilith\Just_Lilith.Unity\bin\Release\net6.0\Just_Lilith.Core.pdb
+D:\Code\Just_Lilith\Just_Lilith.Unity\obj\Release\net6.0\Just_Lilith.Unity.csproj.AssemblyReference.cache
+D:\Code\Just_Lilith\Just_Lilith.Unity\obj\Release\net6.0\Just_Lilith.Unity.GeneratedMSBuildEditorConfig.editorconfig
+D:\Code\Just_Lilith\Just_Lilith.Unity\obj\Release\net6.0\Just_Lilith.Unity.csproj.CoreCompileInputs.cache
+D:\Code\Just_Lilith\Just_Lilith.Unity\obj\Release\net6.0\Just_Lilith.Unity.sourcelink.json
+D:\Code\Just_Lilith\Just_Lilith.Unity\obj\Release\net6.0\Just_Lil.9D4D9B4F.Up2Date
+D:\Code\Just_Lilith\Just_Lilith.Unity\obj\Release\net6.0\Just_Lilith.Unity.dll
+D:\Code\Just_Lilith\Just_Lilith.Unity\obj\Release\net6.0\refint\Just_Lilith.Unity.dll
+D:\Code\Just_Lilith\Just_Lilith.Unity\obj\Release\net6.0\Just_Lilith.Unity.pdb
+D:\Code\Just_Lilith\Just_Lilith.Unity\obj\Release\net6.0\ref\Just_Lilith.Unity.dll

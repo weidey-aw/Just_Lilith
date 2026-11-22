@@ -1,0 +1,8 @@
+# 构建产物（Release 产物按发布需要保留在 bin\Release 并纳入版本管理）
+dist/
+obj/pkg/
+_backup/
+**/bin/Debug/
+**/obj/Debug/
+.vs/
+*.user
