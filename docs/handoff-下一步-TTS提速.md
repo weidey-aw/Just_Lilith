@@ -1,7 +1,11 @@
 # 交接提示词：先把 TTS 播放提速做完（阶段 1 + 阶段 2）
 
+> **状态（2026-11-23）：阶段 1 与阶段 2 都已实现、构建、部署并真机验证完成。**
+> 实测结果见文末「落地结果」；正文保留为当时的任务说明，不用再照着重做一遍。
+> 阶段 3（主动台词预合成）、阶段 4（流式 LLM）仍未做。
+
 > 使用方式：把下面「=== 提示词开始 ===」到「=== 提示词结束 ===」之间的内容整段粘贴给新窗口。
-> 配套文档：`docs/主动对话与窥屏-需求整理与可行性.md`（第 5 章是 TTS 方案）。
+> 配套文档：`docs/主动对话与窥屏-需求整理与可行性.md`（第 5 章是 TTS 方案，5.9 是落地结果）。
 
 ---
 
@@ -109,3 +113,39 @@
 - 服务端不能并行：并行发请求只会排队，**预取深度 = 1 是上限也是最优**。
 
 === 提示词结束 ===
+
+---
+
+# 落地结果（2026-11-23，阶段 1 + 阶段 2 已完成）
+
+## 改了什么
+
+| 文件 | 改动 |
+| --- | --- |
+| `Unity/Speech/SpeechPipeline.cs`（新增） | `ReadyChunk` + `SpeechPipeline`：生产者线程串行合成、`SemaphoreSlim(ahead)` 背压、`ConcurrentQueue` 就绪队列、`TryTakeReady/IsFinished/Cancel` |
+| `Unity/Speech/MainThreadSpeechController.cs` | 单 Task 状态机换成流水线；`BeginSequence/UpdateSpeechSequence/PresentAndPlay/FinishSequence/DisposePipeline`；复用 `LocalTtsClient`；`chunk_timing` / `speech_sequence_done` 埋点 |
+| `Unity/Speech/SpeechSplitSynthesizer.cs` | `Split(text, firstChunkMaxSpeakable)`：首段 ≤22 可读字，超长按标点切一刀，后半段仍守 ≤56 |
+
+## 实测（同一台机器、中文、`total_s` 从第 1 段合成起算到末段播完）
+
+| 场景 | 段数 | 音频合计 | 总时长 | 等待开销 | gap p50 |
+| --- | --- | --- | --- | --- | --- |
+| 改造前（严格串行） | 9 | 86.69s | 133.62s | 46.93s（54%） | 5784ms |
+| **预取深度 1** | 10 | 104.56s | **113.41s** | **8.85s（8.5%）** | **0ms** |
+| 预取深度 1 | 6 | 69.97s | 74.64s | 4.67s（6.7%） | 0ms |
+| 预取深度 1 | 4 | 48.18s | 52.44s | 4.26s（8.8%） | 0ms |
+
+- 等待开销 **46.93s → 4.3–8.9s（约 -81%～-91%）**；除第 1 段（首次合成）和第 2 段外，
+  其余每段 `gap_before_ms` 都是 **0**；
+- 参考样本（8 段、音频 74.9s）推算 ≈ **81–85s**，满足 ≤95s；
+- 无回归：段序正确、每段都有 `TalkAction; event=started`、无 `bubble_hold_lost` /
+  `rebubble=1` / `chunk_failed` / `chunk_out_of_order`；TTS 关闭仍整段走文字；
+  退出后 `python.exe` 归零（`MainThread; state=stopped; pending_cancelled=true`）。
+
+## 仍然没做的
+
+1. **"播放中发新消息立刻掐掉旧语音"没有实现**：旧的那条仍会播完，新回复排在后面。
+   改造前就是这个行为，本次只保证**旧段不会冒到新回复后面**。要做得把聊天提交事件接到控制器上。
+2. `——`/`……` 切出的 2–4 字极短段仍会让下一段合成溢出一次（4–6s 空档）；
+   要消掉需要"短段合并"，会改断句与停顿，未动。
+3. 阶段 3（主动台词预合成）、阶段 4（流式 LLM）未做。

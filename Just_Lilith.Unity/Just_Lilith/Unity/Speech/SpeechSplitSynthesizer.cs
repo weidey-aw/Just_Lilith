@@ -359,9 +359,14 @@ internal static class SpeechSplitSynthesizer
 		if (chunks.Count <= 1)
 		{
 			// 整段只有一片：照旧直接用原文，只在首段过长时切出前半句。
-			if (TryCutHead(source, firstChunkMaxSpeakable, out string sourceHead, out string sourceTail))
+			if (TryCutHead(source, firstChunkMaxSpeakable, out string sourceHead, out string sourceTail) && SpeakableCount(sourceTail) > 3)
 			{
-				return new string[2] { sourceHead, sourceTail };
+				// 后半段仍要守住每段 ≤56 的约定：否则会留下一整段几十秒的长音频，
+				// 逐段对齐和预取都白做了。
+				List<string> tailChunks = HardSplit(sourceTail, MaxChunkSpeakable);
+				List<string> capped = new List<string>(tailChunks.Count + 1) { sourceHead };
+				capped.AddRange(tailChunks);
+				return capped;
 			}
 			return new string[1] { source };
 		}

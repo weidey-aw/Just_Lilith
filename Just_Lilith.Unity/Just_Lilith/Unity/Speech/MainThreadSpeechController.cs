@@ -19,8 +19,6 @@ public sealed class MainThreadSpeechController
 {
 	private sealed record PendingSpeech(SpeechSynthesisRequest Request, DateTimeOffset CreatedAt, long Generation);
 
-	private sealed record WorkResult(long Generation, DateTimeOffset CreatedAt, PcmWaveData? Wave, Exception? Error, long SynthMs);
-
 	private const int QueueLimit = 3;
 
 	/// <summary>首段可读字上限：第一句短一点，第一段音频能更早出现（0＝不限制）。</summary>
@@ -54,7 +52,20 @@ public sealed class MainThreadSpeechController
 
 	private Task _lastSave = Task.CompletedTask;
 
-	private Task<WorkResult>? _active;
+	/// <summary>当前这条回复的预取流水线（阶段 2）：生产者合成、主线程取就绪段播放。</summary>
+	private SpeechPipeline? _pipeline;
+
+	/// <summary>已经从队列取出、但这一帧还没能推上气泡的段（PresentSpeechChunk 失败要重试）。</summary>
+	private ReadyChunk? _pendingPresent;
+
+	/// <summary>下一条要呈现的段用第几个显示序号（0 起）。跳段时序号仍然连续，保证首段走 index=0 分支。</summary>
+	private int _nextPresentIndex;
+
+	/// <summary>已经呈现过的最大源段号，用来校验段序、挡住重复/倒退的段。</summary>
+	private int _lastSourceIndex = -1;
+
+	/// <summary>"等待第 N 段合成"文案的去重，避免每帧刷 UI。</summary>
+	private int _waitingStatusIndex = -1;
 
 	private Guid _activeMessageId;
 
@@ -65,11 +76,6 @@ public sealed class MainThreadSpeechController
 	private IReadOnlyList<string> _activeChunks = Array.Empty<string>();
 
 	private int _activeChunkIndex;
-
-	private PcmWaveData? _readyWave;
-
-	/// <summary>当前就绪段合成花了多少毫秒（chunk_timing 埋点用）。</summary>
-	private long _readyWaveSynthMs;
 
 	private bool _speechStartedReported;
 
@@ -90,13 +96,12 @@ public sealed class MainThreadSpeechController
 	/// <summary>播放器开始空闲的时刻（段间空档从这里算起）。</summary>
 	private double _playbackIdleSince = -1.0;
 
+	/// <summary>上一帧是否在播放：用来捕捉"刚播完"这一帧。</summary>
+	private bool _audioWasPlaying;
+
 	private double _sequenceAudioSeconds;
 
 	private int _sequenceChunkCount;
-
-	private int _chunkFailedCount;
-
-	private CancellationTokenSource? _operation;
 
 	private GameObject? _audioObject;
 
@@ -150,7 +155,7 @@ public sealed class MainThreadSpeechController
 	{
 		get
 		{
-			if (_active != null)
+			if (_pipeline != null)
 			{
 				return true;
 			}
@@ -279,72 +284,35 @@ public sealed class MainThreadSpeechController
 		{
 			// 服务掉线或语音被关掉：把显示权交还桥，别让整条回复卡在“等语音”上。
 			_bridge.ReleaseSpeechManaged(_activeMessageId);
+			DisposePipeline();
 			_activeChunks = Array.Empty<string>();
 			_activeChunkIndex = 0;
-			_readyWave = null;
+			_pendingPresent = null;
 			_activeRequest = null;
 		}
-		if ((Object)(object)_clip != (Object)null && (Object)(object)_audio != (Object)null && !_audio.isPlaying)
+		bool audioPlaying = IsAudioPlaying();
+		if (_audioWasPlaying && !audioPlaying)
 		{
-			// 播放器从这一帧开始空闲：段间空档（gap_before_ms）从这里算起。
+			// 上一段刚播完：段间空档（gap_before_ms）从这一帧算起。
 			_playbackIdleSince = Time.unscaledTime;
-			if (_activeChunkIndex + 1 < _activeChunks.Count && CanSpeak)
+		}
+		_audioWasPlaying = audioPlaying;
+		if (_pipeline != null && !audioPlaying)
+		{
+			if (!CanSpeak)
 			{
-				// 还有下一段：先停当前音频，再合成并显示下一段，做到文字跟着语音一段一段走。
-				_activeChunkIndex++;
-				ReleaseClip();
-				StartActiveChunk();
+				// 语音中途不可用：收掉这一条，别让队列继续往前跑。
+				FinishSequence(aborted: true);
 			}
 			else
 			{
-				_bridge.OnSpeechPlaybackFinished(_activeMessageId);
-				_talkAction.Finish();
-				ReleaseClip();
-				_bridge.ReleaseSpeechManaged(_activeMessageId);
-				LogSpeechSequenceDone();
-				_activeChunks = Array.Empty<string>();
-				_activeChunkIndex = 0;
-				_activeRequest = null;
-				_speechStartedReported = false;
-				SetStatus("播放完成；等待下一条已显示的气泡。");
+				UpdateSpeechSequence();
+				if (IsAudioPlaying())
+				{
+					// 这一帧刚开播：和旧流程一样，不再往下推其它事。
+					return;
+				}
 			}
-		}
-		if (_readyWave != null && CanSpeak)
-		{
-			string text = ((_activeChunkIndex >= 0 && _activeChunkIndex < _activeChunks.Count) ? _activeChunks[_activeChunkIndex] : _activeText);
-			if (!_talkStartedForChunk)
-			{
-				_talkAction.OnSpeechStarted(text, (float)_readyWave.DurationSeconds);
-				_talkStartedForChunk = true;
-			}
-			float holdSeconds = (float)_readyWave.DurationSeconds + 15f;
-			if (!_bridge.PresentSpeechChunk(_activeMessageId, _activeChunkIndex, Math.Max(1, _activeChunks.Count), text, holdSeconds))
-			{
-				return;
-			}
-			long gapMs = (long)Math.Round(Math.Max(0.0, (double)Time.unscaledTime - Math.Max(0.0, _playbackIdleSince)) * 1000.0);
-			_log.LogInfo("module=TTS; event=chunk_timing; index=" + (_activeChunkIndex + 1) + "; synth_ms=" + _readyWaveSynthMs + "; audio_s=" + _readyWave.DurationSeconds.ToString("0.00") + "; gap_before_ms=" + gapMs);
-			_sequenceAudioSeconds += _readyWave.DurationSeconds;
-			try
-			{
-				Play(_readyWave);
-			}
-			catch (Exception error)
-			{
-				ReleaseClip();
-				_bridge.OnSpeechPlaybackSkipped(_activeMessageId);
-				_bridge.ReleaseSpeechManaged(_activeMessageId);
-				_readyWave = null;
-				Fail(error);
-				return;
-			}
-			_readyWave = null;
-			if (!_speechStartedReported)
-			{
-				_bridge.OnSpeechPlaybackStarted(_activeMessageId);
-				_speechStartedReported = true;
-			}
-			return;
 		}
 		OrdinaryChatOutput output;
 		while (_bridge.TryDequeueTtsText(out output))
@@ -417,34 +385,7 @@ public sealed class MainThreadSpeechController
 				_bridge.OnSpeechPlaybackSkipped(output.MessageId);
 			}
 		}
-		Task<WorkResult> active = _active;
-		if (active != null && active.IsCompleted)
-		{
-			WorkResult result2 = _active.GetAwaiter().GetResult();
-			_active = null;
-			_operation = null;
-			if (result2.Generation == _generation && CanSpeak)
-			{
-				if (result2.Error != null)
-				{
-					_bridge.OnSpeechPlaybackSkipped(_activeMessageId);
-					if (!_speechStartedReported)
-					{
-						_bridge.ReleaseSpeechManaged(_activeMessageId);
-					}
-					_activeChunks = Array.Empty<string>();
-					_activeChunkIndex = 0;
-					_activeRequest = null;
-					Fail(result2.Error);
-				}
-				else if ((object)result2.Wave != null)
-				{
-					_readyWave = result2.Wave;
-					_readyWaveSynthMs = result2.SynthMs;
-				}
-			}
-		}
-		if (_active != null || !((Object)(object)_clip == (Object)null) || _readyWave != null || !CanSpeak)
+		if (_pipeline != null || IsAudioPlaying() || !CanSpeak)
 		{
 			return;
 		}
@@ -455,22 +396,7 @@ public sealed class MainThreadSpeechController
 			{
 				if (!(DateTimeOffset.UtcNow - pendingSpeech.CreatedAt > MaximumAge))
 				{
-					_activeMessageId = pendingSpeech.Request.RequestId;
-					_activeText = pendingSpeech.Request.Text;
-					_activeRequest = pendingSpeech.Request;
-					IReadOnlyList<string> readOnlyList = SpeechSplitSynthesizer.Split(pendingSpeech.Request.Text, FirstChunkMaxSpeakable);
-					_activeChunks = ((readOnlyList.Count > 0) ? readOnlyList : new string[1] { pendingSpeech.Request.Text });
-					_activeChunkIndex = 0;
-					_speechStartedReported = false;
-					_talkStartedForChunk = false;
-					_readyWave = null;
-					_readyWaveSynthMs = 0L;
-					_sequenceStartedAt = Time.unscaledTime;
-					_playbackIdleSince = _sequenceStartedAt;
-					_sequenceAudioSeconds = 0.0;
-					_sequenceChunkCount = _activeChunks.Count;
-					_chunkFailedCount = 0;
-					StartActiveChunk();
+					BeginSequence(pendingSpeech.Request);
 					break;
 				}
 				Expired("语音排队已超过 45 秒");
@@ -479,47 +405,190 @@ public sealed class MainThreadSpeechController
 		}
 	}
 
-	/// <summary>开始合成当前段；合成完成后由 Update 在气泡上显示这一段并播放。</summary>
-	private void StartActiveChunk()
+	/// <summary>开始一条新回复：切片 → 建预取流水线（生产者立刻开始合成第 1 段）。</summary>
+	private void BeginSequence(SpeechSynthesisRequest request)
 	{
-		if (_activeRequest == null || _activeChunks.Count == 0)
+		_activeMessageId = request.RequestId;
+		_activeText = request.Text;
+		_activeRequest = request;
+		IReadOnlyList<string> chunks = SpeechSplitSynthesizer.Split(request.Text, FirstChunkMaxSpeakable);
+		_activeChunks = ((chunks.Count > 0) ? chunks : new string[1] { request.Text });
+		_activeChunkIndex = 0;
+		_speechStartedReported = false;
+		_talkStartedForChunk = false;
+		_pendingPresent = null;
+		_nextPresentIndex = 0;
+		_lastSourceIndex = -1;
+		_waitingStatusIndex = -1;
+		_audioWasPlaying = false;
+		_sequenceStartedAt = Time.unscaledTime;
+		_playbackIdleSince = _sequenceStartedAt;
+		_sequenceAudioSeconds = 0.0;
+		_sequenceChunkCount = _activeChunks.Count;
+		DisposePipeline();
+		_pipeline = new SpeechPipeline(AcquireTtsClient(Settings.ServiceUrl), Settings.ServiceUrl, _activeChunks, request.Language, request.Directive, 1, _log, _lifetime.Token);
+		SetStatus("正在合成第 1/" + _activeChunks.Count + " 段" + LanguageName(request.Language) + "语音；文字会跟着语音逐段出现。");
+	}
+
+	private static string LanguageName(SpeechLanguage language)
+	{
+		return (language == SpeechLanguage.Japanese) ? "日语" : "中文";
+	}
+
+	/// <summary>
+	/// 播放器空闲时推进这条回复：取一段就绪音频 → 起口型 → 推气泡文字 → 播放。
+	/// 就绪队列空且生产者还在跑就等着，生产者跑完就收尾。
+	/// </summary>
+	private void UpdateSpeechSequence()
+	{
+		SpeechPipeline pipeline = _pipeline;
+		if (pipeline == null)
 		{
 			return;
 		}
-		_talkStartedForChunk = false;
-		int index = Math.Min(_activeChunkIndex, _activeChunks.Count - 1);
-		SpeechSynthesisRequest request = _activeRequest with
+		if (_pendingPresent == null)
 		{
-			RequestId = Guid.NewGuid(),
-			Text = _activeChunks[index]
-		};
-		_operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
-		_active = RunChunkSynthesis(request, Settings.ServiceUrl, _operation);
-		SetStatus("正在合成第 " + (_activeChunkIndex + 1) + "/" + _activeChunks.Count + " 段" + ((request.Language == SpeechLanguage.Japanese) ? "日语" : "中文") + "语音；文字会跟着语音逐段出现。");
+			ReadyChunk ready;
+			while (pipeline.TryTakeReady(out ready))
+			{
+				if (ready.Index > _lastSourceIndex)
+				{
+					_pendingPresent = ready;
+					break;
+				}
+				_log.LogWarning("module=TTS; event=chunk_out_of_order; index=" + (ready.Index + 1) + "; last_shown=" + (_lastSourceIndex + 1) + "; text_logged=false");
+			}
+		}
+		if (_pendingPresent != null)
+		{
+			PresentAndPlay(_pendingPresent);
+			return;
+		}
+		if (pipeline.IsFinished)
+		{
+			// 生产者已经彻底结束：这时候队列才不会再变，可以安全判定“整条播完”。
+			ReadyChunk leftover;
+			if (pipeline.TryTakeReady(out leftover) && leftover.Index > _lastSourceIndex)
+			{
+				_pendingPresent = leftover;
+				PresentAndPlay(leftover);
+				return;
+			}
+			FinishSequence(aborted: false);
+			return;
+		}
+		// 生产者还在合成：等它就绪，别每帧都刷 UI。
+		int waiting = Math.Min(pipeline.TotalChunks, pipeline.Handled + 1);
+		if (_waitingStatusIndex != waiting)
+		{
+			_waitingStatusIndex = waiting;
+			SetStatus("正在合成第 " + waiting + "/" + pipeline.TotalChunks + " 段" + LanguageName(_activeRequest?.Language ?? Settings.Language) + "语音；等它就绪后接着播。");
+		}
 	}
 
-	private async Task<WorkResult> RunChunkSynthesis(SpeechSynthesisRequest request, string serviceUrl, CancellationTokenSource cancellation)
+	/// <summary>把一段就绪音频推上气泡并播放。返回 false 表示这一帧还没能放进去（下一帧重试）。</summary>
+	private bool PresentAndPlay(ReadyChunk chunk)
 	{
-		DateTimeOffset startedAt = DateTimeOffset.UtcNow;
+		int count = Math.Max(1, _activeChunks.Count);
+		int displayIndex = _nextPresentIndex;
+		if (!_talkStartedForChunk)
+		{
+			// 必须先起说话动画再推气泡：顺序反了游戏会结束对话、气泡被顶掉。
+			_talkAction.OnSpeechStarted(chunk.Text, (float)chunk.Wave.DurationSeconds);
+			_talkStartedForChunk = true;
+		}
+		float holdSeconds = (float)chunk.Wave.DurationSeconds + 15f;
+		if (!_bridge.PresentSpeechChunk(_activeMessageId, displayIndex, count, chunk.Text, holdSeconds))
+		{
+			return false;
+		}
+		long gapMs = (long)Math.Round(Math.Max(0.0, (double)Time.unscaledTime - Math.Max(0.0, _playbackIdleSince)) * 1000.0);
+		_log.LogInfo("module=TTS; event=chunk_timing; index=" + (chunk.Index + 1) + "; synth_ms=" + chunk.SynthMs + "; audio_s=" + chunk.Wave.DurationSeconds.ToString("0.00") + "; gap_before_ms=" + gapMs + "; display_index=" + (displayIndex + 1) + "; total=" + count);
+		_sequenceAudioSeconds += chunk.Wave.DurationSeconds;
 		try
 		{
-			LocalTtsClient client = AcquireTtsClient(serviceUrl);
-			PcmWaveData wave = await SpeechSplitSynthesizer.SynthesizeChunkAsync(client, request, cancellation.Token).ConfigureAwait(continueOnCapturedContext: false);
-			return new WorkResult(0L, DateTimeOffset.UtcNow, wave, null, ElapsedMs(startedAt));
+			Play(chunk.Wave);
 		}
 		catch (Exception error)
 		{
-			return new WorkResult(0L, DateTimeOffset.UtcNow, null, error, ElapsedMs(startedAt));
+			ReleaseClip();
+			_pendingPresent = null;
+			Fail(error);
+			FinishSequence(aborted: true);
+			return false;
 		}
-		finally
+		_pendingPresent = null;
+		_lastSourceIndex = chunk.Index;
+		_activeChunkIndex = chunk.Index;
+		_nextPresentIndex = displayIndex + 1;
+		_talkStartedForChunk = false;
+		_waitingStatusIndex = -1;
+		if (!_speechStartedReported)
 		{
-			cancellation.Dispose();
+			_bridge.OnSpeechPlaybackStarted(_activeMessageId);
+			_speechStartedReported = true;
+		}
+		return true;
+	}
+
+	/// <summary>收掉这一条：结束口型、放掉音频、交还显示权、销毁流水线。</summary>
+	private void FinishSequence(bool aborted)
+	{
+		Guid messageId = _activeMessageId;
+		int failed = _pipeline?.Failed ?? 0;
+		if (_speechStartedReported)
+		{
+			_bridge.OnSpeechPlaybackFinished(messageId);
+		}
+		else
+		{
+			// 一段都没放出来：让桥按原逻辑把文字补显示，别把整条回复吞掉。
+			_bridge.OnSpeechPlaybackSkipped(messageId);
+		}
+		_talkAction.Finish();
+		ReleaseClip();
+		_bridge.ReleaseSpeechManaged(messageId);
+		LogSpeechSequenceDone(failed);
+		DisposePipeline();
+		_pendingPresent = null;
+		_nextPresentIndex = 0;
+		_lastSourceIndex = -1;
+		_waitingStatusIndex = -1;
+		_audioWasPlaying = false;
+		_activeChunks = Array.Empty<string>();
+		_activeChunkIndex = 0;
+		_activeRequest = null;
+		_activeText = null;
+		_speechStartedReported = false;
+		_talkStartedForChunk = false;
+		if (!aborted)
+		{
+			SetStatus("播放完成；等待下一条已显示的气泡。");
 		}
 	}
 
-	private static long ElapsedMs(DateTimeOffset startedAt)
+	private void DisposePipeline()
 	{
-		return (long)Math.Round((DateTimeOffset.UtcNow - startedAt).TotalMilliseconds);
+		SpeechPipeline pipeline = _pipeline;
+		_pipeline = null;
+		if (pipeline == null)
+		{
+			return;
+		}
+		try
+		{
+			pipeline.Dispose();
+		}
+		catch (Exception error)
+		{
+			_log.LogWarning("module=TTS; event=pipeline_dispose_failed; code=" + error.GetType().Name);
+		}
+	}
+
+	private bool IsAudioPlaying()
+	{
+		AudioSource audio = _audio;
+		return (Object)(object)audio != (Object)null && audio.isPlaying;
 	}
 
 	/// <summary>
@@ -537,7 +606,7 @@ public sealed class MainThreadSpeechController
 		_ttsClientUrl = serviceUrl;
 		if (previous != null)
 		{
-			if (_active == null)
+			if (_pipeline == null)
 			{
 				RetireTtsClient(previous);
 			}
@@ -563,7 +632,7 @@ public sealed class MainThreadSpeechController
 	private void DrainRetiredTtsClients()
 	{
 		LocalTtsClient? retired = _retiredTtsClient;
-		if (retired == null || _active != null)
+		if (retired == null || _pipeline != null)
 		{
 			return;
 		}
@@ -572,7 +641,7 @@ public sealed class MainThreadSpeechController
 	}
 
 	/// <summary>整条回复播完：输出本次的端到端耗时，供真机验证对比。</summary>
-	private void LogSpeechSequenceDone()
+	private void LogSpeechSequenceDone(int failedChunks)
 	{
 		if (_sequenceStartedAt < 0.0)
 		{
@@ -580,7 +649,7 @@ public sealed class MainThreadSpeechController
 		}
 		double totalSeconds = Math.Max(0.0, (double)Time.unscaledTime - _sequenceStartedAt);
 		_sequenceStartedAt = -1.0;
-		_log.LogInfo("module=TTS; event=speech_sequence_done; chunks=" + _sequenceChunkCount + "; total_s=" + totalSeconds.ToString("0.00") + "; audio_s=" + _sequenceAudioSeconds.ToString("0.00") + "; failed=" + _chunkFailedCount);
+		_log.LogInfo("module=TTS; event=speech_sequence_done; chunks=" + _sequenceChunkCount + "; total_s=" + totalSeconds.ToString("0.00") + "; audio_s=" + _sequenceAudioSeconds.ToString("0.00") + "; failed=" + failedChunks);
 	}
 
 	private void Expired(string reason)
@@ -745,7 +814,10 @@ public sealed class MainThreadSpeechController
 		_ignoreBefore = DateTimeOffset.UtcNow;
 		_pending.Clear();
 		_bridge.ClearPendingSpeech();
-		Cancel(_operation);
+		// 预取流水线必须跟着一起取消：否则生产者还会继续合成旧段，
+		// 旧段会冒到新回复后面。
+		DisposePipeline();
+		_pendingPresent = null;
 		_talkAction.Finish();
 		ReleaseClip();
 	}
@@ -813,7 +885,9 @@ public sealed class MainThreadSpeechController
 			lastSave = _lastSave;
 		}
 		Cancel(_lifetime);
-		Cancel(_operation);
+		// _lifetime 是流水线的父 token，上面这一步已经让生产者停下；
+		// 这里只做非阻塞的队列清理，真正的 Dispose 留给主线程收尾。
+		_pipeline?.Cancel();
 		_service.RequestStop();
 		if (!lastSave.Wait(TimeSpan.FromSeconds(2.0)))
 		{
@@ -838,7 +912,8 @@ public sealed class MainThreadSpeechController
 		}
 		_activeChunks = Array.Empty<string>();
 		_activeChunkIndex = 0;
-		_readyWave = null;
+		DisposePipeline();
+		_pendingPresent = null;
 		_activeRequest = null;
 		_bridge.ClearPendingSpeech();
 		Action result;
