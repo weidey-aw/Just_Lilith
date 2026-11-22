@@ -19,9 +19,12 @@ public sealed class MainThreadSpeechController
 {
 	private sealed record PendingSpeech(SpeechSynthesisRequest Request, DateTimeOffset CreatedAt, long Generation);
 
-	private sealed record WorkResult(long Generation, DateTimeOffset CreatedAt, PcmWaveData? Wave, Exception? Error);
+	private sealed record WorkResult(long Generation, DateTimeOffset CreatedAt, PcmWaveData? Wave, Exception? Error, long SynthMs);
 
 	private const int QueueLimit = 3;
+
+	/// <summary>首段可读字上限：第一句短一点，第一段音频能更早出现（0＝不限制）。</summary>
+	private const int FirstChunkMaxSpeakable = 22;
 
 	private static readonly TimeSpan MaximumAge = TimeSpan.FromSeconds(45.0);
 
@@ -65,11 +68,33 @@ public sealed class MainThreadSpeechController
 
 	private PcmWaveData? _readyWave;
 
+	/// <summary>当前就绪段合成花了多少毫秒（chunk_timing 埋点用）。</summary>
+	private long _readyWaveSynthMs;
+
 	private bool _speechStartedReported;
 
 	private bool _talkStartedForChunk;
 
 	private readonly TalkActionDriver _talkAction;
+
+	/// <summary>整条消息复用的 TTS 客户端（阶段 1：连接复用，不再每段 new 一个 HttpClient）。</summary>
+	private LocalTtsClient? _ttsClient;
+
+	private string _ttsClientUrl = "";
+
+	/// <summary>服务地址变了之后退役的客户端：等手上没有在跑的合成再释放。</summary>
+	private LocalTtsClient? _retiredTtsClient;
+
+	private double _sequenceStartedAt = -1.0;
+
+	/// <summary>播放器开始空闲的时刻（段间空档从这里算起）。</summary>
+	private double _playbackIdleSince = -1.0;
+
+	private double _sequenceAudioSeconds;
+
+	private int _sequenceChunkCount;
+
+	private int _chunkFailedCount;
 
 	private CancellationTokenSource? _operation;
 
@@ -204,6 +229,7 @@ public sealed class MainThreadSpeechController
 		{
 			result();
 		}
+		DrainRetiredTtsClients();
 		Task<SpeechSettings> loading = _loading;
 		if (loading != null && loading.IsCompleted)
 		{
@@ -260,6 +286,8 @@ public sealed class MainThreadSpeechController
 		}
 		if ((Object)(object)_clip != (Object)null && (Object)(object)_audio != (Object)null && !_audio.isPlaying)
 		{
+			// 播放器从这一帧开始空闲：段间空档（gap_before_ms）从这里算起。
+			_playbackIdleSince = Time.unscaledTime;
 			if (_activeChunkIndex + 1 < _activeChunks.Count && CanSpeak)
 			{
 				// 还有下一段：先停当前音频，再合成并显示下一段，做到文字跟着语音一段一段走。
@@ -273,6 +301,7 @@ public sealed class MainThreadSpeechController
 				_talkAction.Finish();
 				ReleaseClip();
 				_bridge.ReleaseSpeechManaged(_activeMessageId);
+				LogSpeechSequenceDone();
 				_activeChunks = Array.Empty<string>();
 				_activeChunkIndex = 0;
 				_activeRequest = null;
@@ -293,6 +322,9 @@ public sealed class MainThreadSpeechController
 			{
 				return;
 			}
+			long gapMs = (long)Math.Round(Math.Max(0.0, (double)Time.unscaledTime - Math.Max(0.0, _playbackIdleSince)) * 1000.0);
+			_log.LogInfo("module=TTS; event=chunk_timing; index=" + (_activeChunkIndex + 1) + "; synth_ms=" + _readyWaveSynthMs + "; audio_s=" + _readyWave.DurationSeconds.ToString("0.00") + "; gap_before_ms=" + gapMs);
+			_sequenceAudioSeconds += _readyWave.DurationSeconds;
 			try
 			{
 				Play(_readyWave);
@@ -408,6 +440,7 @@ public sealed class MainThreadSpeechController
 				else if ((object)result2.Wave != null)
 				{
 					_readyWave = result2.Wave;
+					_readyWaveSynthMs = result2.SynthMs;
 				}
 			}
 		}
@@ -425,12 +458,18 @@ public sealed class MainThreadSpeechController
 					_activeMessageId = pendingSpeech.Request.RequestId;
 					_activeText = pendingSpeech.Request.Text;
 					_activeRequest = pendingSpeech.Request;
-					IReadOnlyList<string> readOnlyList = SpeechSplitSynthesizer.Split(pendingSpeech.Request.Text);
+					IReadOnlyList<string> readOnlyList = SpeechSplitSynthesizer.Split(pendingSpeech.Request.Text, FirstChunkMaxSpeakable);
 					_activeChunks = ((readOnlyList.Count > 0) ? readOnlyList : new string[1] { pendingSpeech.Request.Text });
 					_activeChunkIndex = 0;
 					_speechStartedReported = false;
 					_talkStartedForChunk = false;
 					_readyWave = null;
+					_readyWaveSynthMs = 0L;
+					_sequenceStartedAt = Time.unscaledTime;
+					_playbackIdleSince = _sequenceStartedAt;
+					_sequenceAudioSeconds = 0.0;
+					_sequenceChunkCount = _activeChunks.Count;
+					_chunkFailedCount = 0;
 					StartActiveChunk();
 					break;
 				}
@@ -459,22 +498,89 @@ public sealed class MainThreadSpeechController
 		SetStatus("正在合成第 " + (_activeChunkIndex + 1) + "/" + _activeChunks.Count + " 段" + ((request.Language == SpeechLanguage.Japanese) ? "日语" : "中文") + "语音；文字会跟着语音逐段出现。");
 	}
 
-	private static async Task<WorkResult> RunChunkSynthesis(SpeechSynthesisRequest request, string serviceUrl, CancellationTokenSource cancellation)
+	private async Task<WorkResult> RunChunkSynthesis(SpeechSynthesisRequest request, string serviceUrl, CancellationTokenSource cancellation)
 	{
+		DateTimeOffset startedAt = DateTimeOffset.UtcNow;
 		try
 		{
-			using LocalTtsClient client = new LocalTtsClient(serviceUrl);
+			LocalTtsClient client = AcquireTtsClient(serviceUrl);
 			PcmWaveData wave = await SpeechSplitSynthesizer.SynthesizeChunkAsync(client, request, cancellation.Token).ConfigureAwait(continueOnCapturedContext: false);
-			return new WorkResult(0L, DateTimeOffset.UtcNow, wave, null);
+			return new WorkResult(0L, DateTimeOffset.UtcNow, wave, null, ElapsedMs(startedAt));
 		}
 		catch (Exception error)
 		{
-			return new WorkResult(0L, DateTimeOffset.UtcNow, null, error);
+			return new WorkResult(0L, DateTimeOffset.UtcNow, null, error, ElapsedMs(startedAt));
 		}
 		finally
 		{
 			cancellation.Dispose();
 		}
+	}
+
+	private static long ElapsedMs(DateTimeOffset startedAt)
+	{
+		return (long)Math.Round((DateTimeOffset.UtcNow - startedAt).TotalMilliseconds);
+	}
+
+	/// <summary>
+	/// 取本次要用的 TTS 客户端。整条会话复用同一个实例以复用 TCP 连接；
+	/// 只有服务地址变了才换新的（旧实例等空下来再释放，避免打断在跑的请求）。
+	/// </summary>
+	private LocalTtsClient AcquireTtsClient(string serviceUrl)
+	{
+		if (_ttsClient != null && string.Equals(_ttsClientUrl, serviceUrl, StringComparison.Ordinal))
+		{
+			return _ttsClient;
+		}
+		LocalTtsClient? previous = _ttsClient;
+		_ttsClient = new LocalTtsClient(serviceUrl);
+		_ttsClientUrl = serviceUrl;
+		if (previous != null)
+		{
+			if (_active == null)
+			{
+				RetireTtsClient(previous);
+			}
+			else
+			{
+				_retiredTtsClient = previous;
+			}
+		}
+		return _ttsClient;
+	}
+
+	private static void RetireTtsClient(LocalTtsClient client)
+	{
+		try
+		{
+			client.Dispose();
+		}
+		catch (Exception)
+		{
+		}
+	}
+
+	private void DrainRetiredTtsClients()
+	{
+		LocalTtsClient? retired = _retiredTtsClient;
+		if (retired == null || _active != null)
+		{
+			return;
+		}
+		_retiredTtsClient = null;
+		RetireTtsClient(retired);
+	}
+
+	/// <summary>整条回复播完：输出本次的端到端耗时，供真机验证对比。</summary>
+	private void LogSpeechSequenceDone()
+	{
+		if (_sequenceStartedAt < 0.0)
+		{
+			return;
+		}
+		double totalSeconds = Math.Max(0.0, (double)Time.unscaledTime - _sequenceStartedAt);
+		_sequenceStartedAt = -1.0;
+		_log.LogInfo("module=TTS; event=speech_sequence_done; chunks=" + _sequenceChunkCount + "; total_s=" + totalSeconds.ToString("0.00") + "; audio_s=" + _sequenceAudioSeconds.ToString("0.00") + "; failed=" + _chunkFailedCount);
 	}
 
 	private void Expired(string reason)
@@ -494,24 +600,6 @@ public sealed class MainThreadSpeechController
 			_log.LogInfo((object)"module=TTS; event=backlog_trimmed; text_logged=false");
 		}
 		_pending.Enqueue(next);
-	}
-
-	private static async Task<WorkResult> RunSynthesis(PendingSpeech next, string serviceUrl, CancellationTokenSource cancellation)
-	{
-		try
-		{
-			using LocalTtsClient client = new LocalTtsClient(serviceUrl);
-			PcmWaveData wave = await SpeechSplitSynthesizer.SynthesizeChunkAsync(client, next.Request, cancellation.Token).ConfigureAwait(continueOnCapturedContext: false);
-			return new WorkResult(next.Generation, next.CreatedAt, wave, null);
-		}
-		catch (Exception error)
-		{
-			return new WorkResult(next.Generation, next.CreatedAt, null, error);
-		}
-		finally
-		{
-			cancellation.Dispose();
-		}
 	}
 
 	private void Play(PcmWaveData wave)
@@ -768,5 +856,18 @@ public sealed class MainThreadSpeechController
 		_clip = null;
 		_audio = null;
 		_audioObject = null;
+		LocalTtsClient? ttsClient = _ttsClient;
+		_ttsClient = null;
+		_ttsClientUrl = "";
+		if (ttsClient != null)
+		{
+			RetireTtsClient(ttsClient);
+		}
+		LocalTtsClient? retiredClient = _retiredTtsClient;
+		_retiredTtsClient = null;
+		if (retiredClient != null)
+		{
+			RetireTtsClient(retiredClient);
+		}
 	}
 }

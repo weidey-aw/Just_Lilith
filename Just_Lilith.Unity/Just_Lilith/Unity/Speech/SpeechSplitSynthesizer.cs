@@ -343,31 +343,117 @@ internal static class SpeechSplitSynthesizer
 	/// 只做分片，不合成。聊天侧按这些切片逐段合成、逐段显示，
 	/// 用于让气泡文字与语音一段一段对齐。
 	/// </summary>
-	internal static IReadOnlyList<string> Split(string? text)
+	/// <param name="text">整段回复。</param>
+	/// <param name="firstChunkMaxSpeakable">
+	/// 首段可读字上限（0 或负数＝不限制）。首段超长时按标点再切一刀，
+	/// 让第一段音频更早出现；切出的后半段顺延为第 2 段，段数会 +1。
+	/// </param>
+	internal static IReadOnlyList<string> Split(string? text, int firstChunkMaxSpeakable = 0)
 	{
-		string text2 = SpeechTextSanitizer.StripTrailingSignature(text);
-		if (string.IsNullOrWhiteSpace(text2))
+		string source = SpeechTextSanitizer.StripTrailingSignature(text);
+		if (string.IsNullOrWhiteSpace(source))
 		{
 			return Array.Empty<string>();
 		}
-		List<SpeechChunk> list = BuildChunks(text2);
-		if (list.Count <= 1)
+		List<SpeechChunk> chunks = BuildChunks(source);
+		if (chunks.Count <= 1)
 		{
-			return new string[1] { text2 };
-		}
-		List<string> list2 = new List<string>(list.Count);
-		foreach (SpeechChunk item in list)
-		{
-			if (!string.IsNullOrWhiteSpace(item.Text))
+			// 整段只有一片：照旧直接用原文，只在首段过长时切出前半句。
+			if (TryCutHead(source, firstChunkMaxSpeakable, out string sourceHead, out string sourceTail))
 			{
-				list2.Add(item.Text);
+				return new string[2] { sourceHead, sourceTail };
+			}
+			return new string[1] { source };
+		}
+		List<string> texts = new List<string>(chunks.Count + 1);
+		if (TryCutHead(chunks[0].Text, firstChunkMaxSpeakable, out string head, out string tail))
+		{
+			texts.Add(head);
+			// 小尾巴并进下一段，避免出现只有两三个字的气泡。
+			if (SpeakableCount(tail) <= 3 && SpeakableCount(tail) + SpeakableCount(chunks[1].Text) <= MaxChunkSpeakable)
+			{
+				texts.Add(tail + "，" + chunks[1].Text);
+				for (int i = 2; i < chunks.Count; i++)
+				{
+					AddChunkText(texts, chunks[i].Text);
+				}
+			}
+			else
+			{
+				texts.Add(tail);
+				for (int i = 1; i < chunks.Count; i++)
+				{
+					AddChunkText(texts, chunks[i].Text);
+				}
 			}
 		}
-		if (list2.Count == 0)
+		else
 		{
-			return new string[1] { text2 };
+			for (int i = 0; i < chunks.Count; i++)
+			{
+				AddChunkText(texts, chunks[i].Text);
+			}
 		}
-		return list2;
+		return texts.Count == 0 ? new string[1] { source } : texts;
+	}
+
+	private static void AddChunkText(List<string> texts, string? text)
+	{
+		if (!string.IsNullOrWhiteSpace(text))
+		{
+			texts.Add(text);
+		}
+	}
+
+	/// <summary>
+	/// 按可读字上限把一段文本切成前后两截。切点优先落在标点上（与 HardSplit 的取舍一致），
+	/// 兜底才按字数硬切；切不动（本来就够短/切完有空段）返回 false。
+	/// </summary>
+	private static bool TryCutHead(string text, int maxSpeakable, out string head, out string tail)
+	{
+		head = text;
+		tail = "";
+		if (maxSpeakable <= 0 || string.IsNullOrEmpty(text) || SpeakableCount(text) <= maxSpeakable)
+		{
+			return false;
+		}
+		int speakable = 0;
+		int hardCut = -1;
+		int softCut = -1;
+		for (int i = 0; i < text.Length; i++)
+		{
+			char c = text[i];
+			if (!char.IsWhiteSpace(c) && !char.IsPunctuation(c) && !char.IsSymbol(c))
+			{
+				speakable++;
+			}
+			if (speakable >= maxSpeakable && hardCut < 0)
+			{
+				hardCut = i + 1;
+			}
+			if (speakable > maxSpeakable)
+			{
+				break;
+			}
+			if (speakable >= maxSpeakable - 8 && (c == '，' || c == '、' || c == '；' || c == '：' || c == ' ' || c == ',' || c == ';' || c == ':'))
+			{
+				softCut = i + 1;
+			}
+		}
+		int cut = ((softCut > 0) ? softCut : ((hardCut > 0) ? hardCut : text.Length));
+		if (cut <= 0 || cut >= text.Length)
+		{
+			return false;
+		}
+		string candidateHead = text.Substring(0, cut).Trim();
+		string candidateTail = text.Substring(cut).Trim();
+		if (candidateHead.Length == 0 || candidateTail.Length == 0)
+		{
+			return false;
+		}
+		head = candidateHead;
+		tail = candidateTail;
+		return true;
 	}
 
 	/// <summary>合成单个切片（带静音/坏波重试）。</summary>
