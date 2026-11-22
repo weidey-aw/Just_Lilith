@@ -67,6 +67,8 @@ public sealed class MainThreadSpeechController
 
 	private bool _speechStartedReported;
 
+	private bool _talkStartedForChunk;
+
 	private readonly TalkActionDriver _talkAction;
 
 	private CancellationTokenSource? _operation;
@@ -281,7 +283,12 @@ public sealed class MainThreadSpeechController
 		if (_readyWave != null && CanSpeak)
 		{
 			string text = ((_activeChunkIndex >= 0 && _activeChunkIndex < _activeChunks.Count) ? _activeChunks[_activeChunkIndex] : _activeText);
-			float holdSeconds = (float)_readyWave.DurationSeconds + 6f;
+			if (!_talkStartedForChunk)
+			{
+				_talkAction.OnSpeechStarted(text, (float)_readyWave.DurationSeconds);
+				_talkStartedForChunk = true;
+			}
+			float holdSeconds = (float)_readyWave.DurationSeconds + 15f;
 			if (!_bridge.PresentSpeechChunk(_activeMessageId, _activeChunkIndex, Math.Max(1, _activeChunks.Count), text, holdSeconds))
 			{
 				return;
@@ -422,6 +429,7 @@ public sealed class MainThreadSpeechController
 					_activeChunks = ((readOnlyList.Count > 0) ? readOnlyList : new string[1] { pendingSpeech.Request.Text });
 					_activeChunkIndex = 0;
 					_speechStartedReported = false;
+					_talkStartedForChunk = false;
 					_readyWave = null;
 					StartActiveChunk();
 					break;
@@ -439,6 +447,7 @@ public sealed class MainThreadSpeechController
 		{
 			return;
 		}
+		_talkStartedForChunk = false;
 		int index = Math.Min(_activeChunkIndex, _activeChunks.Count - 1);
 		SpeechSynthesisRequest request = _activeRequest with
 		{
@@ -526,7 +535,6 @@ public sealed class MainThreadSpeechController
 		_audio.clip = _clip;
 		_audio.volume = Settings.Volume;
 		_audio.Play();
-		_talkAction.OnSpeechStarted(_activeText ?? "", (float)wave.DurationSeconds);
 		SetStatus("Unity 正在播放：可选反应音 → TTS 正文。");
 	}
 

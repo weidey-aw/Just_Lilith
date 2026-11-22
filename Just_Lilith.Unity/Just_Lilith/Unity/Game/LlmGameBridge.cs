@@ -324,6 +324,7 @@ internal sealed class LlmGameBridge : IOrdinaryChatOutputSink, IThinkingBubbleSi
 		// 我们自己在推气泡：这期间别让回退服务把同一句再播一遍。
 		VoiceFallbackService.SuppressFor(TimeSpan.FromSeconds(20.0));
 		float keepAlive = Mathf.Max((float)BubblePresentationTiming.KeepAliveNodeDuration.TotalSeconds, holdSeconds);
+		float keepAliveNode = (float)BubblePresentationTiming.KeepAliveNodeDuration.TotalSeconds;
 		PendingBubble pendingBubble = null;
 		lock (_messageGate)
 		{
@@ -345,7 +346,7 @@ internal sealed class LlmGameBridge : IOrdinaryChatOutputSink, IThinkingBubbleSi
 			VoiceFallbackService.SuppressFor(TimeSpan.FromSeconds(20.0));
 			try
 			{
-				if (!(_forceSay?.Invoke(_dialogueManager, new object[3] { text, "", keepAlive }) is bool flag && flag))
+				if (!(_forceSay?.Invoke(_dialogueManager, new object[3] { text, "", keepAliveNode }) is bool flag && flag))
 				{
 					return false;
 				}
@@ -368,7 +369,7 @@ internal sealed class LlmGameBridge : IOrdinaryChatOutputSink, IThinkingBubbleSi
 			bool flag2 = IsOwnedBubbleCurrent();
 			try
 			{
-				if (!(_forceSay?.Invoke(_dialogueManager, new object[3] { text, "", keepAlive }) is bool flag3 && flag3) && !flag2)
+				if (!(_forceSay?.Invoke(_dialogueManager, new object[3] { text, "", keepAliveNode }) is bool flag3 && flag3) && !flag2)
 				{
 					return false;
 				}
@@ -385,7 +386,7 @@ internal sealed class LlmGameBridge : IOrdinaryChatOutputSink, IThinkingBubbleSi
 			_replyTypingObserved = 0f;
 			_replyTypingFloor = (float)BubblePresentationTiming.PlanTypingDuration(chunkText).TotalSeconds;
 			_replyHoldSeconds = keepAlive;
-			_log.LogInfo("module=GameBridge; event=speech_chunk_shown; index=" + (index + 1) + "; total=" + count + "; chars=" + ((chunkText == null) ? 0 : chunkText.Length) + ((!flag2) ? "; rebubble=1" : ""));
+			_log.LogInfo("module=GameBridge; event=speech_chunk_shown; index=" + (index + 1) + "; total=" + count + "; chars=" + ((chunkText == null) ? 0 : chunkText.Length) + ((!flag2) ? ("; rebubble=1; dialogue_active=" + (IsDialogueActive() ? "1" : "0")) : ""));
 			return true;
 		}
 		return false;
@@ -661,6 +662,15 @@ internal sealed class LlmGameBridge : IOrdinaryChatOutputSink, IThinkingBubbleSi
 		}
 	}
 
+	private static string Head(string? value)
+	{
+		if (string.IsNullOrEmpty(value))
+		{
+			return "<null>";
+		}
+		return (value.Length <= 24) ? value : value.Substring(0, 24);
+	}
+
 	private void KeepAliveBubble()
 	{
 		try
@@ -715,6 +725,8 @@ internal sealed class LlmGameBridge : IOrdinaryChatOutputSink, IThinkingBubbleSi
 		if (!IsOwnedReplyBubbleCurrent())
 		{
 			_replyHoldActive = false;
+			bool flag2 = TryReadCurrentBubbleText(out string current);
+			_log.LogInfo("module=GameBridge; event=bubble_hold_lost; dialogue_active=" + (flag2 ? "1" : "0") + "; expected_len=" + ((_lastShownText == null) ? (-1) : _lastShownText.Length) + "; current_len=" + ((current == null) ? (-1) : current.Length) + "; expected_head=" + Head(_lastShownText) + "; current_head=" + Head(current));
 			return;
 		}
 		float num = Time.unscaledTime - _replyHoldStartedAt;
