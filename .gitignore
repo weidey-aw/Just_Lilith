@@ -7,3 +7,5 @@ _screens/
 **/obj/Debug/
 .vs/
 *.user
+BUILD.md
+_decomp/
