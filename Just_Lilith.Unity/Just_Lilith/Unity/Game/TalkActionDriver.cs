@@ -77,6 +77,7 @@ internal sealed class TalkActionDriver
 			_activeUntil = Time.unscaledTime + Math.Max(0.5f, durationSeconds);
 			InvokePlay(val);
 			SetSpeaking(speaking: true);
+			_log.LogInfo("module=TalkAction; event=started; chars=" + text.Length + "; duration_seconds=" + durationSeconds.ToString("0.0"));
 		}
 		catch (Exception ex)
 		{
@@ -91,6 +92,7 @@ internal sealed class TalkActionDriver
 			return;
 		}
 		_activeNode = null;
+		_log.LogInfo("module=TalkAction; event=finished");
 		try
 		{
 			if (_speakingSignalOn)
