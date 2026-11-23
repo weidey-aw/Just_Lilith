@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using BepInEx.Logging;
@@ -33,6 +34,8 @@ public sealed class MainThreadSpeechController
 	private readonly SpeechSettingsStore _store;
 
 	private readonly ManualLogSource _log;
+
+	private readonly bool _logSpeechText;
 
 	private readonly ITtsServiceManager _service;
 
@@ -180,14 +183,53 @@ public sealed class MainThreadSpeechController
 		}
 	}
 
-	internal MainThreadSpeechController(LlmGameBridge bridge, LlmConfigurationView view, string settingsPath, ManualLogSource log, ITtsServiceManager service)
+	internal MainThreadSpeechController(LlmGameBridge bridge, LlmConfigurationView view, string settingsPath, ManualLogSource log, ITtsServiceManager service, bool logSpeechText = true)
 	{
 		_bridge = bridge;
 		_view = view;
 		_store = new SpeechSettingsStore(settingsPath);
 		_log = log;
 		_service = service;
+		_logSpeechText = logSpeechText;
 		_talkAction = new TalkActionDriver(log);
+	}
+
+	/// <summary>
+	/// 把台词原文和切片结果打进日志（排查断句用）。默认开，基础项配置
+	/// <c>ui.log_speech_text</c> 可以关掉。
+	/// </summary>
+	private void LogSplitDiagnostics(string text, IReadOnlyList<string> chunks)
+	{
+		if (!_logSpeechText || _log == null)
+		{
+			return;
+		}
+		try
+		{
+			_log.LogInfo("module=TTS; event=speech_text; chars=" + (text?.Length ?? 0) + "; text=" + OneLine(text));
+			StringBuilder builder = new StringBuilder();
+			for (int i = 0; i < chunks.Count; i++)
+			{
+				if (i > 0)
+				{
+					builder.Append(" | ");
+				}
+				builder.Append(i + 1).Append(':').Append(chunks[i]);
+			}
+			_log.LogInfo("module=TTS; event=split; chunks=" + chunks.Count + "; first_max=" + FirstChunkMaxSpeakable + "; parts=" + builder);
+		}
+		catch (Exception)
+		{
+		}
+	}
+
+	private static string OneLine(string text)
+	{
+		if (string.IsNullOrEmpty(text))
+		{
+			return "";
+		}
+		return text.Replace('\r', ' ').Replace('\n', ' ');
 	}
 
 	public bool IsCurrentGeneration(long generation)
@@ -413,6 +455,7 @@ public sealed class MainThreadSpeechController
 		_activeRequest = request;
 		IReadOnlyList<string> chunks = SpeechSplitSynthesizer.Split(request.Text, FirstChunkMaxSpeakable);
 		_activeChunks = ((chunks.Count > 0) ? chunks : new string[1] { request.Text });
+		LogSplitDiagnostics(request.Text, _activeChunks);
 		_activeChunkIndex = 0;
 		_speechStartedReported = false;
 		_talkStartedForChunk = false;

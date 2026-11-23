@@ -93,90 +93,111 @@ internal static class SpeechSplitSynthesizer
 			list.Add(segment);
 			return list;
 		}
-		string[] array = Regex.Split(segment, "(?<=[。！？!?；;])");
-		string text = "";
-		string[] array2 = array;
-		for (int i = 0; i < array2.Length; i++)
+		return ChunkByBoundaries(segment, 56);
+	}
+
+	/// <summary>
+	/// 按「句末标点 &gt; 分句标点 &gt; 逗号顿号 &gt; 硬切」的优先级把文本切成不超过 max 的段。
+	/// 关键点：切点是在整个窗口里找**最后一个**标点，而不是像以前只在 max-8 那 8 个字里找 ——
+	/// 中文长句常常整段只有一个逗号，旧逻辑找不到就按字数硬切，听感就是「一句话被劈开」。
+	/// </summary>
+	private static List<string> ChunkByBoundaries(string text, int maxSpeakable)
+	{
+		List<string> list = new List<string>();
+		string rest = text.Trim();
+		int guard = 0;
+		while (rest.Length > 0 && guard++ < 128)
 		{
-			string text2 = array2[i].Trim();
-			if (text2.Length == 0)
+			if (SpeakableCount(rest) <= maxSpeakable)
 			{
-				continue;
+				list.Add(rest);
+				break;
 			}
-			if (SpeakableCount(text2) > 56)
+			int cut = FindCutIndex(rest, maxSpeakable, Math.Max(6, maxSpeakable * 2 / 5));
+			if (cut <= 0 || cut >= rest.Length)
 			{
-				if (text.Length > 0)
-				{
-					list.Add(text);
-					text = "";
-				}
-				foreach (string item in HardSplit(text2, 56))
-				{
-					list.Add(item);
-				}
+				list.Add(rest);
+				break;
 			}
-			else if (text.Length > 0 && SpeakableCount(text) + SpeakableCount(text2) > 56)
+			string head = rest.Substring(0, cut).Trim();
+			rest = rest.Substring(cut).Trim();
+			if (head.Length > 0)
 			{
-				list.Add(text);
-				text = text2;
+				list.Add(head);
 			}
-			else
-			{
-				text += text2;
-			}
-		}
-		if (text.Length > 0)
-		{
-			list.Add(text);
 		}
 		return list;
 	}
 
+	/// <summary>
+	/// 在不超过 <paramref name="maxSpeakable"/> 的范围内挑切点，返回切点后的下标；挑不到返回 -1。
+	/// 句末标点只要出现在「够长」的位置（≥ 70% 上限）就优先用，否则退到逗号顿号，再不行硬切。
+	/// </summary>
+	private static int FindCutIndex(string text, int maxSpeakable, int minSpeakable)
+	{
+		int speakable = 0;
+		int hardCut = -1;
+		int sentenceCut = -1;
+		int clauseCut = -1;
+		for (int i = 0; i < text.Length; i++)
+		{
+			char c = text[i];
+			if (!char.IsWhiteSpace(c) && !char.IsPunctuation(c) && !char.IsSymbol(c))
+			{
+				speakable++;
+			}
+			int cut = i + 1;
+			if (speakable >= maxSpeakable && hardCut < 0)
+			{
+				hardCut = cut;
+			}
+			if (speakable > maxSpeakable)
+			{
+				break;
+			}
+			if (speakable < minSpeakable)
+			{
+				continue;
+			}
+			if (IsSentenceBoundary(c))
+			{
+				sentenceCut = cut;
+			}
+			else if (IsClauseBoundary(c))
+			{
+				clauseCut = cut;
+			}
+		}
+		int lateThreshold = Math.Max(minSpeakable, maxSpeakable * 7 / 10);
+		if (sentenceCut > 0 && SpeakableCount(text.Substring(0, sentenceCut)) >= lateThreshold)
+		{
+			return sentenceCut;
+		}
+		if (clauseCut > 0)
+		{
+			return clauseCut;
+		}
+		if (sentenceCut > 0)
+		{
+			return sentenceCut;
+		}
+		return hardCut;
+	}
+
+	private static bool IsSentenceBoundary(char c)
+	{
+		return c == '。' || c == '！' || c == '？' || c == '!' || c == '?' || c == '\n' || c == '；' || c == ';' || c == '：' || c == ':';
+	}
+
+	private static bool IsClauseBoundary(char c)
+	{
+		return c == '，' || c == '、' || c == ',' || c == ' ';
+	}
+
+	/// <summary>兼容旧调用点：按上限切，走同一套标点优先规则。</summary>
 	private static List<string> HardSplit(string sentence, int maxSpeakable)
 	{
-		List<string> list = new List<string>();
-		string text = sentence;
-		while (SpeakableCount(text) > maxSpeakable)
-		{
-			int num = 0;
-			int num2 = -1;
-			int num3 = -1;
-			for (int i = 0; i < text.Length; i++)
-			{
-				char c = text[i];
-				if (!char.IsWhiteSpace(c) && !char.IsPunctuation(c) && !char.IsSymbol(c))
-				{
-					num++;
-				}
-				if (num >= maxSpeakable && num3 < 0)
-				{
-					num3 = i + 1;
-				}
-				if (num > maxSpeakable)
-				{
-					break;
-				}
-				if (num >= maxSpeakable - 8 && (c == '，' || c == '、' || c == '；' || c == '：' || c == ' ' || c == ',' || c == ';' || c == ':'))
-				{
-					num2 = i + 1;
-				}
-			}
-			if (num2 <= 0)
-			{
-				num2 = ((num3 > 0) ? num3 : text.Length);
-			}
-			string text2 = text.Substring(0, num2).Trim();
-			if (text2.Length > 0)
-			{
-				list.Add(text2);
-			}
-			text = text.Substring(num2).Trim();
-		}
-		if (text.Length > 0)
-		{
-			list.Add(text);
-		}
-		return list;
+		return ChunkByBoundaries(sentence, maxSpeakable);
 	}
 
 	private static List<SpeechChunk> CoalesceShortChunks(List<SpeechChunk> chunks)
@@ -188,7 +209,7 @@ internal static class SpeechSplitSynthesizer
 		List<SpeechChunk> list = new List<SpeechChunk>(chunks.Count);
 		foreach (SpeechChunk chunk in chunks)
 		{
-			if (list.Count > 0 && SpeakableCount(chunk.Text) <= 3)
+			if (list.Count > 0 && SpeakableCount(chunk.Text) <= 6 && SpeakableCount(list[list.Count - 1].Text) + SpeakableCount(chunk.Text) <= MaxChunkSpeakable)
 			{
 				SpeechChunk speechChunk = list[list.Count - 1];
 				list[list.Count - 1] = speechChunk with
@@ -201,7 +222,7 @@ internal static class SpeechSplitSynthesizer
 				list.Add(chunk);
 			}
 		}
-		if (list.Count > 1 && SpeakableCount(list[0].Text) <= 3)
+		if (list.Count > 1 && SpeakableCount(list[0].Text) <= 6 && SpeakableCount(list[0].Text) + SpeakableCount(list[1].Text) <= MaxChunkSpeakable)
 		{
 			SpeechChunk speechChunk2 = list[0];
 			SpeechChunk speechChunk3 = list[1];
@@ -422,30 +443,7 @@ internal static class SpeechSplitSynthesizer
 		{
 			return false;
 		}
-		int speakable = 0;
-		int hardCut = -1;
-		int softCut = -1;
-		for (int i = 0; i < text.Length; i++)
-		{
-			char c = text[i];
-			if (!char.IsWhiteSpace(c) && !char.IsPunctuation(c) && !char.IsSymbol(c))
-			{
-				speakable++;
-			}
-			if (speakable >= maxSpeakable && hardCut < 0)
-			{
-				hardCut = i + 1;
-			}
-			if (speakable > maxSpeakable)
-			{
-				break;
-			}
-			if (speakable >= maxSpeakable - 8 && (c == '，' || c == '、' || c == '；' || c == '：' || c == ' ' || c == ',' || c == ';' || c == ':'))
-			{
-				softCut = i + 1;
-			}
-		}
-		int cut = ((softCut > 0) ? softCut : ((hardCut > 0) ? hardCut : text.Length));
+		int cut = FindCutIndex(text, maxSpeakable, Math.Max(6, maxSpeakable * 2 / 5));
 		if (cut <= 0 || cut >= text.Length)
 		{
 			return false;

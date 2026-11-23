@@ -1462,6 +1462,8 @@ public sealed class LlmConfigurationController : IDisposable
 			}
 			catch (OperationCanceledException)
 			{
+				// 取消也要留痕：以前这里什么都不打，外部只看到 generate_failed，无从排查。
+				LogProactiveSkipped("cancelled");
 			}
 			catch (LlmException error)
 			{

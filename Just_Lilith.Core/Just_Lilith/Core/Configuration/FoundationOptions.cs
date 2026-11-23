@@ -14,6 +14,13 @@ public sealed record FoundationUiOptions
 	/// </summary>
 	[JsonPropertyName("legacy_native_injection")]
 	public bool LegacyNativeInjection { get; init; }
+
+	/// <summary>
+	/// 是否把角色台词原文与 TTS 切片结果写进 BepInEx 日志（排查断句用）。
+	/// 默认 true，因为日志是本地的、每次启动重建；不想留文本可以关掉。
+	/// </summary>
+	[JsonPropertyName("log_speech_text")]
+	public bool LogSpeechText { get; init; } = true;
 }
 
 public sealed record FoundationOptions
