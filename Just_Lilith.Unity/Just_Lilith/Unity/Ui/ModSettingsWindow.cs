@@ -886,10 +886,17 @@ internal sealed class ModSettingsWindow
 		if (state == null)
 		{
 			_agentStatusText.text = "Agent 未就绪（可能还在启动）";
-			SetAgentInteractable(toggle: false, persona: false, model: false, reasoning: false, settings: false, cancel: false);
+			// 状态拿不到时仍然允许开开关 / 打开设置，否则用户没法自救。
+			SetAgentInteractable(toggle: true, persona: true, model: false, reasoning: false, settings: true, cancel: false);
 			return null;
 		}
-		_agentStatusText.text = "状态：" + state.Label + (string.IsNullOrWhiteSpace(state.Detail) ? "" : ("\n" + state.Detail));
+		string detail = state.Detail ?? "";
+		int firstBreak = detail.IndexOf('\n');
+		if (firstBreak >= 0)
+		{
+			detail = detail.Substring(0, firstBreak);
+		}
+		_agentStatusText.text = "状态：" + state.Label + (detail.Length == 0 ? "" : ("\n" + SingleLine(detail)));
 		if (_agentToggleText != null)
 		{
 			_agentToggleText.text = ((!state.Enabled) ? "开启 Agent" : (state.Busy ? "Agent 响应中…" : "关闭 Agent"));
