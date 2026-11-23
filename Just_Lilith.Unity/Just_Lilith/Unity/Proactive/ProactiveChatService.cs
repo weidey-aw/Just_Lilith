@@ -54,6 +54,9 @@ internal sealed class ProactiveChatService : IDisposable
 
 	private double _lastUserMessageAt;
 
+	/// <summary>上一次真正发起主动发言的时刻：额度自愈除了看用户静默，也看这条，避免刚说完就立刻再放额度。</summary>
+	private double _lastProactiveAt;
+
 	private double _interest;
 
 	private int _count;
@@ -70,6 +73,18 @@ internal sealed class ProactiveChatService : IDisposable
 	private bool _peeking;
 
 	private DateTimeOffset _lastPeekAtUtc = DateTimeOffset.MinValue;
+
+	/// <summary>上一轮窥屏是从什么时候开始的（看门狗用，超时就强制复位）。</summary>
+	private double _peekStartedAt;
+
+	/// <summary>上一次窥屏失败的时间：失败不占用「最小间隔」，但要有个短退避，别死循环刷视觉接口。</summary>
+	private DateTimeOffset _lastPeekFailureAtUtc = DateTimeOffset.MinValue;
+
+	private int _peekFailureCount;
+
+	private const double PeekFailureBackoffSeconds = 30.0;
+
+	private const double PeekWatchdogSeconds = 30.0;
 
 	private DateTimeOffset _peekDayUtc = DateTimeOffset.MinValue;
 
@@ -141,6 +156,7 @@ internal sealed class ProactiveChatService : IDisposable
 		{
 			double now = Time.unscaledTime;
 			ReloadSettingsIfChanged();
+			ResetStuckPeekIfNeeded(now);
 			ProactiveSettings settings = _settings;
 			if (!settings.Enabled)
 			{
@@ -202,6 +218,7 @@ internal sealed class ProactiveChatService : IDisposable
 		{
 			LogEvent("expired", cue.SourceTag, interest: _interest, count: _count, cap: settings.MaxPerUserMessage, reason: "stage_timeout");
 		});
+		RelaxCapAfterLongSilence(settings, now);
 		ProactiveContextProbe.ProbeResult probe = _probe.Probe();
 		int bonus = ProactiveContextProbe.ComputeStateBonus(settings.UserState, probe.IdleMilliseconds, probe.IsGaming, probe.IsBrowsing);
 		string gate = EvaluateGate(probe);
@@ -242,6 +259,50 @@ internal sealed class ProactiveChatService : IDisposable
 		{
 			CueAndDeliver(settings, probe, nowUtc, test: false);
 		}
+	}
+
+	/// <summary>窥屏卡住时强制复位：转述请求万一不回调，_peeking 会一直是 true，把整条链路堵死。</summary>
+	private void ResetStuckPeekIfNeeded(double now)
+	{
+		if (!_peeking || _peekStartedAt <= 0.0)
+		{
+			return;
+		}
+		if (now - _peekStartedAt < PeekWatchdogSeconds)
+		{
+			return;
+		}
+		_peeking = false;
+		_peekStartedAt = 0.0;
+		_lastPeekFailureAtUtc = DateTimeOffset.UtcNow;
+		_peekFailureCount++;
+		EndThinkingSafe();
+		Log("module=Proactive; event=peek_watchdog_reset; waited_s=" + (int)(now - _peekStartedAt) + "; failures=" + _peekFailureCount);
+	}
+
+	/// <summary>
+	/// 额度自愈：<c>maxPerUserMessage</c> 只按「用户发过消息」清零的话，用户一直不说话
+	/// 就会永久停在 cap_reached。静默超过 2 个期望间隔后把额度放出来。
+	/// </summary>
+	private void RelaxCapAfterLongSilence(ProactiveSettings settings, double now)
+	{
+		if (settings.MaxPerUserMessage <= 0 || _count < settings.MaxPerUserMessage)
+		{
+			return;
+		}
+		double idle = now - _lastUserMessageAt;
+		double relaxAfter = Math.Max(60.0, (double)settings.TargetIntervalSeconds * 2.0);
+		if (idle < relaxAfter)
+		{
+			return;
+		}
+		// 也要隔开两条主动发言：否则额度一会就自愈，变成每拍都能开口。
+		if (now - _lastProactiveAt < relaxAfter)
+		{
+			return;
+		}
+		_count = 0;
+		LogEvent("cap_relaxed", "-", interest: _interest, count: 0, cap: settings.MaxPerUserMessage, reason: "idle_s=" + (int)idle + "; relax_after_s=" + (int)relaxAfter);
 	}
 
 	/// <summary>兴趣累积 + 掷骰。返回 true 表示这一轮该开口（已消费兴趣并 count++）。</summary>
@@ -303,12 +364,12 @@ internal sealed class ProactiveChatService : IDisposable
 		AmbientCueSource source = picked.GetValueOrDefault();
 		if (source == AmbientCueSource.Screen)
 		{
-			if (CanPeek(settings))
+			if (CanPeek(settings, out string peekReason))
 			{
 				BeginPeek(settings, probe, nowUtc, test);
 				return;
 			}
-			LogEvent("skipped", "screen", reason: "peek_unavailable");
+			LogEvent("skipped", "screen", reason: "peek_unavailable:" + peekReason);
 			source = AmbientCueSource.IdleChat;
 		}
 		if (source != AmbientCueSource.IdleChat)
@@ -335,27 +396,78 @@ internal sealed class ProactiveChatService : IDisposable
 		return _generator.TryCreate(settings, AmbientCueSource.IdleChat, idleSeconds, nowUtc, null, SceneMemoryStore.BuildReference(_sceneMemory, settings.SceneMemoryInjectCount));
 	}
 
-	/// <summary>现在允许截屏吗：窥屏开关 + 视觉配置 + Q8 的硬上限。</summary>
-	private bool CanPeek(ProactiveSettings settings)
+	/// <summary>
+	/// 现在能不能截屏：窥屏开关 + 视觉配置 + Q8 的硬上限 + 失败退避。
+	/// <paramref name="reason"/> 会写进日志和页面提示，别再让「没触发」变成黑盒。
+	/// </summary>
+	private bool CanPeek(ProactiveSettings settings, out string reason)
 	{
-		if (!settings.Sources.Screen || string.IsNullOrWhiteSpace(settings.VisionProfileId))
+		reason = "";
+		if (!settings.Sources.Screen)
 		{
+			reason = "source_off";
+			return false;
+		}
+		if (string.IsNullOrWhiteSpace(settings.VisionProfileId))
+		{
+			reason = "vision_unconfigured";
 			return false;
 		}
 		DateTimeOffset nowUtc = DateTimeOffset.UtcNow;
-		if (settings.PeekMinIntervalSeconds > 0 && _lastPeekAtUtc != DateTimeOffset.MinValue && (nowUtc - _lastPeekAtUtc).TotalSeconds < (double)settings.PeekMinIntervalSeconds)
+		if (_lastPeekFailureAtUtc != DateTimeOffset.MinValue && (nowUtc - _lastPeekFailureAtUtc).TotalSeconds < PeekFailureBackoffSeconds)
 		{
+			reason = "failure_backoff; left_s=" + (int)Math.Ceiling(PeekFailureBackoffSeconds - (nowUtc - _lastPeekFailureAtUtc).TotalSeconds) + "; failures=" + _peekFailureCount;
 			return false;
+		}
+		if (settings.PeekMinIntervalSeconds > 0 && _lastPeekAtUtc != DateTimeOffset.MinValue)
+		{
+			double left = (double)settings.PeekMinIntervalSeconds - (nowUtc - _lastPeekAtUtc).TotalSeconds;
+			if (left > 0.0)
+			{
+				reason = "min_interval; left_s=" + (int)Math.Ceiling(left);
+				return false;
+			}
 		}
 		if (settings.PeekMaxPerDay > 0)
 		{
 			RollPeekDay(nowUtc);
 			if (_peekCountToday >= settings.PeekMaxPerDay)
 			{
+				reason = "daily_cap; used=" + _peekCountToday + "; cap=" + settings.PeekMaxPerDay;
 				return false;
 			}
 		}
 		return true;
+	}
+
+	/// <summary>把内部原因翻成人话，给页面提示用。</summary>
+	internal static string DescribePeekDenial(string reason)
+	{
+		if (string.IsNullOrEmpty(reason))
+		{
+			return "";
+		}
+		if (reason.StartsWith("vision_unconfigured", StringComparison.Ordinal))
+		{
+			return "窥屏没开：还没选视觉模型（去「模型 / API」里挑一个 profile 填到「视觉模型」）";
+		}
+		if (reason.StartsWith("source_off", StringComparison.Ordinal))
+		{
+			return "窥屏没开：窥屏开关是关的";
+		}
+		if (reason.StartsWith("min_interval", StringComparison.Ordinal))
+		{
+			return "窥屏太频繁：距上次不足最小间隔（" + reason.Substring("min_interval; ".Length) + "）";
+		}
+		if (reason.StartsWith("daily_cap", StringComparison.Ordinal))
+		{
+			return "窥屏已达当天上限（" + reason.Substring("daily_cap; ".Length) + "）";
+		}
+		if (reason.StartsWith("failure_backoff", StringComparison.Ordinal))
+		{
+			return "上一次窥屏失败了，稍后再试（" + reason.Substring("failure_backoff; ".Length) + "）";
+		}
+		return reason;
 	}
 
 	private void RollPeekDay(DateTimeOffset nowUtc)
@@ -379,6 +491,7 @@ internal sealed class ProactiveChatService : IDisposable
 			return;
 		}
 		_peeking = true;
+		_peekStartedAt = Time.unscaledTime;
 		// Q9：识图这几秒也显示"思考中"，避免看起来像卡住。
 		ShowThinkingSafe();
 		ScreenCapture.CaptureResult capture;
@@ -389,28 +502,26 @@ internal sealed class ProactiveChatService : IDisposable
 		catch (Exception error)
 		{
 			_peeking = false;
+			_peekStartedAt = 0.0;
+			MarkPeekFailed();
 			DegradeToIdle(settings, probe, nowUtc, test, "capture_failed; code=" + error.GetType().Name);
 			return;
 		}
 		if (!capture.Ok)
 		{
 			_peeking = false;
+			_peekStartedAt = 0.0;
+			MarkPeekFailed();
 			DegradeToIdle(settings, probe, nowUtc, test, "capture_" + capture.Reason);
 			return;
 		}
-		DateTimeOffset attemptAt = DateTimeOffset.UtcNow;
-		_lastPeekAtUtc = attemptAt;
-		if (settings.PeekMaxPerDay > 0)
-		{
-			RollPeekDay(attemptAt);
-			_peekCountToday++;
-		}
 		byte[] jpeg = capture.Jpeg!;
-		LogEvent("peek", "screen", extra: "; capture_ms=" + capture.ElapsedMs + "; bytes=" + jpeg.Length + "; w=" + capture.Width + "; h=" + capture.Height + "; vision=" + settings.VisionProfileId);
+		LogEvent("peek", "screen", extra: "; capture_ms=" + capture.ElapsedMs + "; bytes=" + jpeg.Length + "; w=" + capture.Width + "; h=" + capture.Height + "; vision=" + settings.VisionProfileId + "; test=" + Bool(test));
 		string? sceneReference = SceneMemoryStore.BuildReference(_sceneMemory, settings.SceneMemoryInjectCount);
 		_controller.TranscribeScreen(jpeg, settings.VisionProfileId, ScreenPeekTimeoutSeconds, delegate(string? description)
 		{
 			_peeking = false;
+			_peekStartedAt = 0.0;
 			if (_disposed)
 			{
 				EndThinkingSafe();
@@ -418,8 +529,17 @@ internal sealed class ProactiveChatService : IDisposable
 			}
 			if (string.IsNullOrWhiteSpace(description))
 			{
+				MarkPeekFailed();
 				DegradeToIdle(settings, probe, nowUtc, test, "peek_failed");
 				return;
+			}
+			// 成功才计入「最小间隔」和「每天上限」：失败不该让用户白等 5 分钟。
+			_lastPeekAtUtc = DateTimeOffset.UtcNow;
+			_peekFailureCount = 0;
+			if (settings.PeekMaxPerDay > 0)
+			{
+				RollPeekDay(_lastPeekAtUtc);
+				_peekCountToday++;
 			}
 			// 2.4 ②：写场景记忆（只有文字，环形保留）。
 			_sceneMemory = SceneMemoryStore.Append(_sceneMemoryPath, _sceneMemory, description!, nowUtc, settings.SceneMemoryLimit, settings.SceneMemoryDays);
@@ -441,6 +561,47 @@ internal sealed class ProactiveChatService : IDisposable
 			}
 			Deliver(cue, settings, test, staged: false);
 		});
+	}
+
+	private void MarkPeekFailed()
+	{
+		_lastPeekFailureAtUtc = DateTimeOffset.UtcNow;
+		_peekFailureCount++;
+	}
+
+	/// <summary>
+	/// 「现在试一次窥屏」：绕过兴趣与权重，但不绕过视觉配置、最小间隔、当天上限与失败退避。
+	/// 返回空串表示已经发起；否则是给人看的原因。
+	/// </summary>
+	internal string RequestTestPeek()
+	{
+		if (_disposed)
+		{
+			return "主动对话服务未就绪";
+		}
+		ProactiveSettings settings = _settings;
+		if (!settings.Enabled)
+		{
+			return "先打开「主动对话」总开关（窥屏依附于主动对话）";
+		}
+		if (!CanPeek(settings, out string reason))
+		{
+			return DescribePeekDenial(reason);
+		}
+		if (_peeking)
+		{
+			return "上一次窥屏还没结束，等一下";
+		}
+		try
+		{
+			BeginPeek(settings, _probe.Probe(), DateTimeOffset.UtcNow, test: true);
+			LogEvent("peek_manual", "screen");
+			return "";
+		}
+		catch (Exception error)
+		{
+			return "发起窥屏失败：" + error.GetType().Name;
+		}
 	}
 
 	/// <summary>窥屏失败 → 退化成普通闲聊由头；闲聊也关就本轮不开口（不补说、不弹错）。</summary>
@@ -494,6 +655,7 @@ internal sealed class ProactiveChatService : IDisposable
 			return;
 		}
 		_generating = true;
+		_lastProactiveAt = Time.unscaledTime;
 		LogEvent("delivered", tag, interest: _interest, count: _count, cap: settings.MaxPerUserMessage, reason: staged ? "staged" : (test ? "test_mode" : "rolled"));
 		try
 		{

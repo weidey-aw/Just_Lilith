@@ -16,32 +16,30 @@ internal sealed class ProactiveGenerator
 		_random = random ?? throw new ArgumentNullException("random");
 	}
 
-	/// <summary>在"已启用且已实现"的来源里按权重随机挑一个。没有可用来源返回 null。</summary>
+	/// <summary>
+	/// 在"已启用且已实现"的来源里挑一个。
+	/// 窥屏按「权重 / 1000」直接当概率：1000 = 每轮都窥屏（仍受硬上限约束），
+	/// 没抽中窥屏时退回闲聊；闲聊也没开就本轮不开口。
+	/// </summary>
 	public AmbientCueSource? PickSource(ProactiveSettings settings)
 	{
-		int total = 0;
-		foreach (AmbientCueSource candidate in AllSources)
+		if (IsUsable(settings, AmbientCueSource.Screen))
 		{
-			total += WeightIfUsable(settings, candidate);
-		}
-		if (total <= 0)
-		{
-			return null;
-		}
-		int ticket = _random.Next(total);
-		foreach (AmbientCueSource candidate2 in AllSources)
-		{
-			int weight = WeightIfUsable(settings, candidate2);
-			if (weight > 0)
+			int weight = Math.Clamp(settings.Weights.Of(AmbientCueSource.Screen), 0, 1000);
+			if (weight >= 1000)
 			{
-				if (ticket < weight)
-				{
-					return candidate2;
-				}
-				ticket -= weight;
+				return AmbientCueSource.Screen;
+			}
+			if (weight > 0 && _random.Next(1000) < weight)
+			{
+				return AmbientCueSource.Screen;
 			}
 		}
-		return AmbientCueSource.IdleChat;
+		if (IsUsable(settings, AmbientCueSource.IdleChat))
+		{
+			return AmbientCueSource.IdleChat;
+		}
+		return null;
 	}
 
 	/// <summary>这个来源现在能不能用（开关 + 权重 + 已实现）。</summary>

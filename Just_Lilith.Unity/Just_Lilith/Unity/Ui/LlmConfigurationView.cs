@@ -3165,9 +3165,26 @@ public sealed class LlmConfigurationView : MonoBehaviour
 		RunUiCallback("OpenWorldBook", OpenWorldBookFromLilith);
 	}
 
+	/// <summary>「现在试一次窥屏」：直接问主动对话服务能不能截，返回空串表示已发起。</summary>
 	[HideFromIl2Cpp]
-	internal void ModToggleHotkeyCapture()
+	internal string ModTestPeek()
 	{
+		try
+		{
+			if (_proactive == null)
+			{
+				return "主动对话服务未启动";
+			}
+			return _proactive.RequestTestPeek();
+		}
+		catch (Exception error)
+		{
+			return "发起窥屏失败：" + error.GetType().Name;
+		}
+	}
+
+	[HideFromIl2Cpp]
+	internal void ModToggleHotkeyCapture()	{
 		try
 		{
 			if (_chatHotkey.IsCapturing)

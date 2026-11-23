@@ -46,8 +46,12 @@ public sealed record ProactiveWeights
 	[JsonPropertyName("music")]
 	public int Music { get; init; } = 10;
 
+	/// <summary>
+	/// 窥屏权重。语义是「权重 / 1000 就是这一轮窥屏的概率」：
+	/// 300 ≈ 30%、1000 = 每轮都窥屏（仍受最小间隔与每天上限约束）。
+	/// </summary>
 	[JsonPropertyName("screen")]
-	public int Screen { get; init; } = 30;
+	public int Screen { get; init; } = 300;
 
 	public int Of(AmbientCueSource source)
 	{

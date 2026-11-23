@@ -554,8 +554,8 @@ internal sealed class ModSettingsWindow
 		CreateText(group, "PeekToggleLabel", "开关", 14, TextAnchor.MiddleLeft, new Vector2(0f, -44f), new Vector2(140f, 30f), FontStyle.Normal, Color.white);
 		_peekToggleText = CreateButton(group, "PeekToggle", "已关闭", new Vector2(150f, -44f), new Vector2(160f, 30f), TogglePeek).GetComponentInChildren<Text>();
 		CreateText(group, "WeightLabel", "权重", 14, TextAnchor.MiddleLeft, new Vector2(0f, -86f), new Vector2(140f, 30f), FontStyle.Normal, Color.white);
-		_weightInput = CreateInput(group, "WeightInput", "30", new Vector2(150f, -86f), new Vector2(90f, 30f), 4);
-		CreateText(group, "WeightHint", "0–1000，默认 30", 12, TextAnchor.MiddleLeft, new Vector2(252f, -86f), new Vector2(430f, 30f), FontStyle.Normal, Muted);
+		_weightInput = CreateInput(group, "WeightInput", "300", new Vector2(150f, -86f), new Vector2(90f, 30f), 4);
+		CreateText(group, "WeightHint", "0–1000 = 这一轮窥屏的概率（1000 = 每轮都窥屏）", 12, TextAnchor.MiddleLeft, new Vector2(252f, -86f), new Vector2(500f, 30f), FontStyle.Normal, Muted);
 		CreateText(group, "VisionLabel", "视觉模型", 14, TextAnchor.MiddleLeft, new Vector2(0f, -128f), new Vector2(140f, 30f), FontStyle.Normal, Color.white);
 		Button visionButton = CreateButton(group, "VisionChoice", "未配置", new Vector2(150f, -128f), new Vector2(280f, 32f), CycleVisionProfile);
 		_visionText = visionButton.GetComponentInChildren<Text>();
@@ -567,6 +567,7 @@ internal sealed class ModSettingsWindow
 		_peekDailyInput = CreateInput(group, "PeekDailyInput", "20", new Vector2(150f, -212f), new Vector2(90f, 30f), 4);
 		CreateText(group, "PeekDailyHint", "每天最多几次，0 = 不限制", 12, TextAnchor.MiddleLeft, new Vector2(252f, -212f), new Vector2(480f, 30f), FontStyle.Normal, Muted);
 		CreateButton(group, "SavePeek", "保存窥屏设置", new Vector2(0f, -256f), new Vector2(180f, 34f), SavePeek);
+		CreateButton(group, "TestPeekNow", "现在试一次窥屏", new Vector2(200f, -256f), new Vector2(180f, 34f), TestPeekNow);
 		// T6：把耦合关系写在页面上，别再让人以为“单开窥屏”能生效。
 		Text coupling = CreateText(group, "PeekCoupling", "窥屏依附于主动对话开关：主动对话关着的时候，窥屏也不会触发。", 12, TextAnchor.UpperLeft, new Vector2(0f, -304f), new Vector2(ContentWidth, 44f), FontStyle.Normal, Warning);
 		coupling.horizontalOverflow = HorizontalWrapMode.Wrap;
@@ -1285,8 +1286,22 @@ internal sealed class ModSettingsWindow
 		}
 	}
 
-	private void TogglePeek()
+	/// <summary>「现在试一次窥屏」：绕过权重与兴趣，但不绕过视觉配置和硬上限。</summary>
+	private void TestPeekNow()
 	{
+		try
+		{
+			string result = _owner.ModTestPeek();
+			bool failed = !string.IsNullOrEmpty(result);
+			ReportEdit(failed ? result : "已发起一次窥屏（识图几秒钟，之后她会就着画面说一句）", isError: failed);
+		}
+		catch (Exception error)
+		{
+			ReportEdit("试窥屏失败：" + error.GetType().Name, isError: true);
+		}
+	}
+
+	private void TogglePeek()	{
 		try
 		{
 			bool enabled = !_settings.Sources.Screen;
