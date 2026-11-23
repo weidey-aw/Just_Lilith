@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using Just_Lilith.Core.Proactive;
 
 namespace Just_Lilith.Unity.Proactive;
@@ -9,11 +10,69 @@ namespace Just_Lilith.Unity.Proactive;
 /// </summary>
 internal sealed class ProactiveGenerator
 {
+	/// <summary>记住最近几条主动发言（正文摘要），用来避免复读同一个话题。</summary>
+	private const int RecentReplyLimit = 5;
+
+	/// <summary>话题形状轮换：最近两轮用过的形状先不用。</summary>
+	private const int ShapeHistoryLimit = 2;
+
+	/// <summary>话题形状候选。只是给模型一个方向，不给固定句式。</summary>
+	private static readonly string[] TopicShapes = new string[4] { "关心一下她刚才在忙的事", "问一件具体的小事", "说一句你自己的小情绪", "吐槽一句眼前看到的东西" };
+
 	private readonly Random _random;
+
+	private readonly List<string> _recentReplies = new List<string>();
+
+	private readonly List<string> _recentShapes = new List<string>();
+
+	/// <summary>RememberReply 在后台线程调用，构造指令在主线程，两边都要加锁。</summary>
+	private readonly object _sync = new object();
+
+	/// <summary>最近一次构造闲聊指令时用的话题形状（只用于日志）。</summary>
+	internal string LastTopicShape { get; private set; } = "";
+
+	/// <summary>当前记住的主动发言条数（只用于日志）。</summary>
+	internal int RecentReplyCount
+	{
+		get
+		{
+			lock (_sync)
+			{
+				return _recentReplies.Count;
+			}
+		}
+	}
 
 	public ProactiveGenerator(Random random)
 	{
 		_random = random ?? throw new ArgumentNullException("random");
+	}
+
+	/// <summary>记一条刚刚真的说出去的主动发言（只留前 40 字）。</summary>
+	internal void RememberReply(string? text)
+	{
+		if (string.IsNullOrWhiteSpace(text))
+		{
+			return;
+		}
+		string compact = text.Replace('\r', ' ').Replace('\n', ' ').Trim();
+		// 去掉句末标点：下面会用「；」把它们串起来，不然会出现「。；」这种别扭的拼接。
+		while (compact.Length > 0 && "。！？…，、,.!?".IndexOf(compact[compact.Length - 1]) >= 0)
+		{
+			compact = compact.Substring(0, compact.Length - 1).TrimEnd();
+		}
+		if (compact.Length > 40)
+		{
+			compact = compact.Substring(0, 40) + "…";
+		}
+		lock (_sync)
+		{
+			_recentReplies.Add(compact);
+			while (_recentReplies.Count > RecentReplyLimit)
+			{
+				_recentReplies.RemoveAt(0);
+			}
+		}
 	}
 
 	/// <summary>
@@ -62,7 +121,7 @@ internal sealed class ProactiveGenerator
 		return new AmbientCue(source, settings.Weights.Of(source), instruction, nowUtc, nowUtc.AddSeconds(Math.Max(5, settings.StageExpireSeconds)), settings.Weights.Of(source));
 	}
 
-	private static string? BuildInstruction(AmbientCueSource source, int idleSeconds, string? screenDescription, string? sceneMemory)
+	private string? BuildInstruction(AmbientCueSource source, int idleSeconds, string? screenDescription, string? sceneMemory)
 	{
 		switch (source)
 		{
@@ -82,11 +141,54 @@ internal sealed class ProactiveGenerator
 		}
 	}
 
-	private static string BuildIdleChatInstruction(int idleSeconds, string? sceneMemory)
+	/// <summary>
+	/// 闲聊由头。以前这里写着「把之前没说完的话题轻轻接下去」，而系统又不知道上一轮说过什么，
+	/// 结果就是每轮都绕着同一个话题打转。现在改成：给一个「最近没用的方向」，并且明确要求别复读。
+	/// </summary>
+	private string BuildIdleChatInstruction(int idleSeconds, string? sceneMemory)
 	{
 		int minutes = Math.Max(0, idleSeconds / 60);
 		string duration = ((minutes >= 1) ? (minutes + " 分钟") : "一会儿");
-		return "（本次是你自己主动开口，不是在回应某条提问。）" + "用户已经 " + duration + "没有新的输入了，也没有在等你回答什么。" + "请你自己找个由头说一两句，语气自然、轻松，可以是关心、闲聊，或者把之前没说完的话题轻轻接下去；" + "不要解释你为什么突然说话，不要提到“主动”“系统”“提示”这类词，也不要复述这段说明。" + AppendMemory(sceneMemory);
+		string shape = PickTopicShape();
+		return "（本次是你自己主动开口，不是在回应某条提问。）" + "用户已经 " + duration + "没有新的输入了，也没有在等你回答什么。" + "请你自己找个由头说一两句，语气自然、轻松。这次可以顺着这个方向：" + shape + "。" + BuildAvoidRepeatClause() + "不要解释你为什么突然说话，不要提到“主动”“系统”“提示”这类词，也不要复述这段说明。" + AppendMemory(sceneMemory);
+	}
+
+	/// <summary>最近几轮说过的话 + 明确要求换话题。</summary>
+	private string BuildAvoidRepeatClause()
+	{
+		lock (_sync)
+		{
+			if (_recentReplies.Count == 0)
+			{
+				return "";
+			}
+			string joined = string.Join("；", _recentReplies);
+			return "你最近已经主动说过这些：" + joined + "。这次不要重复这些话题，也不要顺着它们继续往下续。" + "如果确实想不出新话题，就直接问她一个具体的小问题。";
+		}
+	}
+
+	/// <summary>挑一个最近两轮没用过的话题形状。</summary>
+	private string PickTopicShape()
+	{
+		lock (_sync)
+		{
+			List<string> available = new List<string>(4);
+			foreach (string shape in TopicShapes)
+			{
+				if (!_recentShapes.Contains(shape))
+				{
+					available.Add(shape);
+				}
+			}
+			string picked = ((available.Count > 0) ? available[_random.Next(available.Count)] : TopicShapes[_random.Next(TopicShapes.Length)]);
+			_recentShapes.Add(picked);
+			while (_recentShapes.Count > ShapeHistoryLimit)
+			{
+				_recentShapes.RemoveAt(0);
+			}
+			LastTopicShape = picked;
+			return picked;
+		}
 	}
 
 	/// <summary>

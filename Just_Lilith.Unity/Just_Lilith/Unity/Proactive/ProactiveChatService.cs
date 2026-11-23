@@ -751,7 +751,7 @@ internal sealed class ProactiveChatService : IDisposable
 		}
 		_generating = true;
 		_lastProactiveAt = Time.unscaledTime;
-		LogEvent("delivered", tag, interest: _interest, count: _count, cap: settings.MaxPerUserMessage, reason: staged ? "staged" : (test ? "test_mode" : "rolled"));
+		LogEvent("delivered", tag, interest: _interest, count: _count, cap: settings.MaxPerUserMessage, reason: staged ? "staged" : (test ? "test_mode" : "rolled"), extra: "; topic=" + ((_generator.LastTopicShape.Length == 0) ? "-" : _generator.LastTopicShape) + "; recent=" + _generator.RecentReplyCount);
 		try
 		{
 			_bridge.ShowThinking();
@@ -778,7 +778,11 @@ internal sealed class ProactiveChatService : IDisposable
 				{
 					LogEvent("skipped", tag, reason: "generate_failed");
 				}
-			}, tag);
+			}, tag, delegate(string? reply)
+			{
+				// 记住她刚主动说过什么：下一轮指令里会明确要求别复读同一个话题。
+				_generator.RememberReply(reply);
+			});
 		}
 		catch (Exception error2)
 		{

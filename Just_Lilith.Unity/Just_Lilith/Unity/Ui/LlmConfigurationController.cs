@@ -1382,7 +1382,7 @@ public sealed class LlmConfigurationController : IDisposable
 	/// 失败只记日志（<c>module=Proactive; event=skipped</c>），不弹窗、不写 UI 错误。
 	/// <paramref name="onDone"/> 保证在主线程之外被恰好调用一次。
 	/// </summary>
-	internal void SendProactive(string instruction, Action<bool> onDone, string? sourceTag = null)
+	internal void SendProactive(string instruction, Action<bool> onDone, string? sourceTag = null, Action<string?>? onReply = null)
 	{
 		if (Volatile.Read(ref _stopped) != 0 || _chatBusy || _connectionBusy)
 		{
@@ -1409,10 +1409,10 @@ public sealed class LlmConfigurationController : IDisposable
 		CancellationTokenSource operation = _chatCancellation;
 		long generation = Interlocked.Increment(ref _chatGeneration);
 		UpdateBusy();
-		SendProactiveAsync(activeProfile, _settings.Revision, instruction, generation, operation, onDone, sourceTag);
+		SendProactiveAsync(activeProfile, _settings.Revision, instruction, generation, operation, onDone, sourceTag, onReply);
 	}
 
-	private async Task SendProactiveAsync(LlmProfileSettings profile, long revision, string instruction, long generation, CancellationTokenSource operation, Action<bool> onDone, string? sourceTag)
+	private async Task SendProactiveAsync(LlmProfileSettings profile, long revision, string instruction, long generation, CancellationTokenSource operation, Action<bool> onDone, string? sourceTag, Action<string?>? onReply)
 	{
 		bool ok = false;
 		try
@@ -1434,6 +1434,14 @@ public sealed class LlmConfigurationController : IDisposable
 				long speechGeneration = _speech?.Generation ?? 0;
 				ParsedChatReply parsedReply = StructuredChatReply.Parse(await _client.CompleteAsync(profile, context.Messages, StructuredChatReply.BuildSystemPrompt(context.SystemPrompt, speechLanguage), operation.Token, speechLanguage == SpeechLanguage.Japanese, null, null).ConfigureAwait(continueOnCapturedContext: false), speechLanguage);
 				DateTimeOffset receivedAtUtc = DateTimeOffset.UtcNow;
+				// 先回传正文：主动对话那边要记住「最近说过什么」，用来避免复读同一个话题。
+				try
+				{
+					onReply?.Invoke(parsedReply.Text);
+				}
+				catch (Exception)
+				{
+				}
 				ActiveConversationSnapshot saved = await Task.Run(() => _activeConversation.AppendAmbientTurn(context.Session.SessionId, context.Session.Conversation.Revision, parsedReply.Text, receivedAtUtc, context.Session.EventsFingerprint, context.Session.ActivationToken)).ConfigureAwait(continueOnCapturedContext: false);
 				await OnUi(delegate
 				{
