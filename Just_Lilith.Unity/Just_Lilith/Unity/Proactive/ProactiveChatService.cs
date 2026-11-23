@@ -98,6 +98,25 @@ internal sealed class ProactiveChatService : IDisposable
 
 	private const int ScreenPeekTimeoutSeconds = 20;
 
+	/// <summary>活动要持续这么久才算「用户真的在干这件事」（抖一下不算）。</summary>
+	private static readonly TimeSpan ActivityConfirmWindow = TimeSpan.FromSeconds(10.0);
+
+	/// <summary>确认之后再过这么久才截图，避免刚切过去就拍。</summary>
+	private const double ActivityPeekDelaySeconds = 20.0;
+
+	/// <summary>同一活动（或换回来）在这段时间内只触发一次窥屏。</summary>
+	private const double ActivityPeekCooldownSeconds = 1800.0;
+
+	private ActivityCategory _lastActivity = ActivityCategory.None;
+
+	private DateTimeOffset _activitySinceUtc = DateTimeOffset.MinValue;
+
+	private double _activityPeekDueAt;
+
+	private ActivityCategory _activityPeekCategory = ActivityCategory.None;
+
+	private DateTimeOffset _lastActivityPeekUtc = DateTimeOffset.MinValue;
+
 	public ProactiveChatService(LlmConfigurationController controller, LlmConfigurationView view, LlmGameBridge bridge, MainThreadSpeechController? speech, string settingsPath, ManualLogSource log)
 	{
 		_controller = controller ?? throw new ArgumentNullException("controller");
@@ -222,7 +241,13 @@ internal sealed class ProactiveChatService : IDisposable
 		ProactiveContextProbe.ProbeResult probe = _probe.Probe();
 		int bonus = ProactiveContextProbe.ComputeStateBonus(settings.UserState, probe.IdleMilliseconds, probe.IsGaming, probe.IsBrowsing);
 		string gate = EvaluateGate(probe);
-		LogEvent("tick", forced ? TestSourceTag : "-", interest: _interest, count: _count, cap: settings.MaxPerUserMessage, reason: (gate.Length == 0) ? "ok" : gate, extra: "; idle_s=" + (IdleSeconds(probe)?.ToString(CultureInfo.InvariantCulture) ?? "unknown") + "; bonus=" + bonus + "; staged=" + _staged.Count + "; expired=" + expired + "; character=" + (string.IsNullOrEmpty(probe.CharacterState) ? "-" : probe.CharacterState) + "; story=" + (probe.StoryPerforming ? "1" : "0"));
+		LogEvent("tick", forced ? TestSourceTag : "-", interest: _interest, count: _count, cap: settings.MaxPerUserMessage, reason: (gate.Length == 0) ? "ok" : gate, extra: "; idle_s=" + (IdleSeconds(probe)?.ToString(CultureInfo.InvariantCulture) ?? "unknown") + "; bonus=" + bonus + "; staged=" + _staged.Count + "; expired=" + expired + "; character=" + (string.IsNullOrEmpty(probe.CharacterState) ? "-" : probe.CharacterState) + "; story=" + (probe.StoryPerforming ? "1" : "0") + "; activity=" + probe.Activity.ToString().ToLowerInvariant());
+
+		// 换活动 → 延迟一次性窥屏：跟主动对话的掷骰完全独立（不看权重、不看兴趣、不占额度）。
+		if (UpdateActivityPeek(settings, probe, nowUtc, now, gate))
+		{
+			return;
+		}
 
 		if (gate.Length > 0)
 		{
@@ -303,6 +328,76 @@ internal sealed class ProactiveChatService : IDisposable
 		}
 		_count = 0;
 		LogEvent("cap_relaxed", "-", interest: _interest, count: 0, cap: settings.MaxPerUserMessage, reason: "idle_s=" + (int)idle + "; relax_after_s=" + (int)relaxAfter);
+	}
+
+	/// <summary>
+	/// 用户换了活动（打游戏 / 看视频 / 上网 / 写代码）→ 确认 10s 后，再过 20s 固定窥一次屏。
+	/// 与主动对话的掷骰完全独立：不看权重、不看兴趣、不占 <c>maxPerUserMessage</c> 额度，
+	/// 只受「窥屏开关 + 视觉配置 + 最小间隔 + 每天上限」约束；同一次活动 30 分钟内只触发一次。
+	/// </summary>
+	/// <returns>true = 这一拍已经发起窥屏，后续掷骰跳过。</returns>
+	private bool UpdateActivityPeek(ProactiveSettings settings, ProactiveContextProbe.ProbeResult probe, DateTimeOffset nowUtc, double now, string gate)
+	{
+		ActivityCategory category = probe.Activity;
+		if (category != _lastActivity)
+		{
+			_lastActivity = category;
+			_activitySinceUtc = nowUtc;
+			_activityPeekDueAt = 0.0;
+			_activityPeekCategory = ActivityCategory.None;
+			if (category != ActivityCategory.None)
+			{
+				LogEvent("activity_changed", category.ToString().ToLowerInvariant(), extra: "; proc=" + (string.IsNullOrEmpty(probe.ForegroundProcess) ? "-" : probe.ForegroundProcess));
+			}
+		}
+		if (category == ActivityCategory.None || nowUtc - _activitySinceUtc < ActivityConfirmWindow)
+		{
+			return false;
+		}
+		if (_lastActivityPeekUtc != DateTimeOffset.MinValue && (nowUtc - _lastActivityPeekUtc).TotalSeconds < ActivityPeekCooldownSeconds)
+		{
+			return false;
+		}
+		if (_activityPeekDueAt <= 0.0)
+		{
+			_activityPeekDueAt = now + ActivityPeekDelaySeconds;
+			_activityPeekCategory = category;
+			LogEvent("activity_peek_scheduled", category.ToString().ToLowerInvariant(), extra: "; delay_s=" + (int)ActivityPeekDelaySeconds);
+			return false;
+		}
+		if (_activityPeekCategory != category)
+		{
+			// 中途换了活动：重新计时，别拿旧活动的截图凑数。
+			_activityPeekCategory = category;
+			_activityPeekDueAt = now + ActivityPeekDelaySeconds;
+			return false;
+		}
+		if (now < _activityPeekDueAt)
+		{
+			return false;
+		}
+		if (!settings.Sources.Screen)
+		{
+			_activityPeekDueAt = 0.0;
+			LogEvent("skipped", "screen", reason: "activity_peek_screen_off");
+			return false;
+		}
+		if (gate.Length > 0)
+		{
+			// 闸门不过（她在睡觉/正在生成/输入框有焦点…）：下一拍再试。
+			return false;
+		}
+		if (!CanPeek(settings, out string reason))
+		{
+			_activityPeekDueAt = 0.0;
+			LogEvent("skipped", "screen", reason: "activity_peek_unavailable:" + reason);
+			return false;
+		}
+		_activityPeekDueAt = 0.0;
+		_lastActivityPeekUtc = nowUtc;
+		LogEvent("activity_peek", category.ToString().ToLowerInvariant(), extra: "; proc=" + (string.IsNullOrEmpty(probe.ForegroundProcess) ? "-" : probe.ForegroundProcess));
+		BeginPeek(settings, probe, nowUtc, test: false);
+		return true;
 	}
 
 	/// <summary>兴趣累积 + 掷骰。返回 true 表示这一轮该开口（已消费兴趣并 count++）。</summary>
