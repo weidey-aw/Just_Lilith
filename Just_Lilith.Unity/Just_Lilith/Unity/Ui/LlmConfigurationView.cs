@@ -360,6 +360,8 @@ public sealed class LlmConfigurationView : MonoBehaviour
 
 	private Transform? _modSkinRoot;
 
+	private bool _legacyNativeInjection = true;
+
 	/// <summary>聊天输入框是否正拿着焦点：主动对话投放闸门要用（用户在打字就别插嘴）。</summary>
 	internal bool IsChatInputFocused => _chatInput != null && _chatInput.isFocused;
 
@@ -809,10 +811,14 @@ public sealed class LlmConfigurationView : MonoBehaviour
 				_gameBridge?.Update();
 				_speechController?.Update();
 				_proactive?.Update();
+				// 聊天框皮肤挂在托盘设置视图上，两种注射模式都要跑；页签本身在里面按 flag 决定。
 				MaintainNativeApiTab();
-				MaintainNativeLilithSpeech();
-				MaintainNativeAgent();
-				MaintainNativeLilithConversations();
+				if (_legacyNativeInjection)
+				{
+					MaintainNativeLilithSpeech();
+					MaintainNativeAgent();
+					MaintainNativeLilithConversations();
+				}
 				MaintainJourneyDialogDrag();
 				_modMenu?.Tick();
 				_modSettings?.Tick();
@@ -1750,8 +1756,15 @@ public sealed class LlmConfigurationView : MonoBehaviour
 				InvalidateTraySettings();
 				return;
 			}
-			EnsureNativeApiTab(transform2);
+			// 聊天框皮肤跟 mod 页签无关，两种模式下都要贴。
 			ApplyNativeChatSkin(transform);
+			if (!_legacyNativeInjection)
+			{
+				// 旧注入已关：不再建 API 页签，游戏本体设置页保持原版。
+				ReportTrayDiagnostic($"state=native_injection_disabled; candidates={_trayCandidateCount}; tab={value}");
+				return;
+			}
+			EnsureNativeApiTab(transform2);
 			if (_gameSettingsTab != null)
 			{
 				_gameSettingsTab.SetActive(value: true);
@@ -2613,7 +2626,7 @@ public sealed class LlmConfigurationView : MonoBehaviour
 	[HideFromIl2Cpp]
 	private void OpenJourneyDialog()
 	{
-		if (_uiRoot == null || _lilithItemRoot == null)
+		if (_uiRoot == null)
 		{
 			return;
 		}
@@ -2657,7 +2670,10 @@ public sealed class LlmConfigurationView : MonoBehaviour
 		CreateButton(gameObject2.transform, "SaveJourneyName", "保存名称", new Vector2(600f, -495f), new Vector2(110f, 36f), SaveJourneyName);
 		_journeyDialogStatus = CreateText(gameObject2.transform, "JourneyStatus", "", 13, TextAnchor.MiddleLeft, new Vector2(20f, -550f), new Vector2(690f, 50f), FontStyle.Normal, Muted);
 		_journeyDialogStatus.horizontalOverflow = HorizontalWrapMode.Wrap;
-		if (!NativeTrayPageSkin.TryApply(gameObject2, _lilithItemRoot, out string diagnostic))
+		// 皮肤模板根独立解析：不再依赖 Lilith 行注入（_lilithItemRoot），关掉旧注入后幻境框照样有皮。
+		Transform journeySkinRoot = ResolveModSkinRoot();
+		string diagnostic = "skin_root=unavailable";
+		if (journeySkinRoot == null || !NativeTrayPageSkin.TryApply(gameObject2, journeySkinRoot, out diagnostic))
 		{
 			ReportJourneyDiagnostic("state=dialog_skin_unresolved; " + diagnostic);
 		}
@@ -2970,6 +2986,269 @@ public sealed class LlmConfigurationView : MonoBehaviour
 	// ---------------- MOD 设置页（阶段 A） ----------------
 
 	/// <summary>
+	/// 是否保留旧的原生注入（API 页签 / TTS 行 / Lilith 行 / 热键行）。
+	/// 由基础项配置 <c>ui.legacy_native_injection</c> 控制，默认 true（行为不变）。
+	/// </summary>
+	internal bool LegacyNativeInjection => _legacyNativeInjection;
+
+	[HideFromIl2Cpp]
+	internal void SetLegacyNativeInjection(bool enabled)
+	{
+		_legacyNativeInjection = enabled;
+		_chatHotkey.NativeInjectionEnabled = enabled;
+		if (!enabled)
+		{
+			// 关掉旧注入时把已经挂上去的东西摘干净，游戏本体设置页回到原版。
+			try
+			{
+				DetachLilithSpeechRows();
+				DetachLilithConversationRows();
+				DetachAgentRows();
+				RestoreNativeSettingsView();
+				if (_gameSettingsTab != null)
+				{
+					_gameSettingsTabButton?.onClick.RemoveAllListeners();
+					UnityEngine.Object.Destroy(_gameSettingsTab);
+				}
+				_gameSettingsTab = null;
+				_gameSettingsTabButton = null;
+			}
+			catch (Exception error)
+			{
+				SafeLogCallbackError("SetLegacyNativeInjection", error);
+			}
+		}
+		SafeLogInfo("module=ModUI; state=legacy_native_injection=" + (enabled ? "true" : "false"));
+	}
+
+	// ---------------- MOD 设置页的读写门面（阶段 B） ----------------
+	// 页面只调这些方法：业务逻辑仍然留在 controller / *_Store 里，门面不做任何复制。
+
+	internal Font? ModSettingsFont => _font;
+
+	// 这两个返回 Core 的纯托管类型，不能暴露给 IL2CPP（否则 Il2CppInterop 会报 unsupported return type）。
+	[HideFromIl2Cpp]
+	internal SpeechSettings GetModSpeechSettings()
+	{
+		return _lastSpeechSettings;
+	}
+
+	[HideFromIl2Cpp]
+	internal TtsServiceState GetModSpeechServiceState()
+	{
+		return _lastServiceState;
+	}
+
+	internal bool ModSpeechLoaded => _speechLoaded;
+
+	internal string ModSpeechStatus => _lastSpeechStatus;
+
+	internal string ModHotkeyText => _chatHotkey.RowText;
+
+	internal bool ModHotkeyCapturing => _chatHotkey.IsCapturing;
+
+	internal bool ModBusy => _connectionBusy || _chatBusy;
+
+	internal bool ModChatBusy => _chatBusy;
+
+	[HideFromIl2Cpp]
+	internal AgentUiState GetModAgentState()
+	{
+		return _callbacks.AgentStatusRequested?.Invoke();
+	}
+
+	[HideFromIl2Cpp]
+	internal void ModAgentToggle()
+	{
+		RunUiCallback("AgentToggle", delegate
+		{
+			_callbacks.AgentToggleRequested?.Invoke();
+		});
+	}
+
+	[HideFromIl2Cpp]
+	internal void ModAgentPersona()
+	{
+		RunUiCallback("AgentPersona", delegate
+		{
+			_callbacks.AgentPersonaRequested?.Invoke();
+		});
+	}
+
+	[HideFromIl2Cpp]
+	internal void ModAgentSettings()
+	{
+		RunUiCallback("AgentSettings", delegate
+		{
+			_callbacks.AgentSettingsRequested?.Invoke();
+		});
+	}
+
+	[HideFromIl2Cpp]
+	internal void ModAgentCancelChat()
+	{
+		RunUiCallback("AgentCancel", delegate
+		{
+			_callbacks.ChatCancelRequested?.Invoke();
+		});
+	}
+
+	[HideFromIl2Cpp]
+	internal void ModAgentSelectModel(string model)
+	{
+		RunUiCallback("AgentModel", delegate
+		{
+			_callbacks.AgentModelSelectedRequested?.Invoke(model);
+		});
+	}
+
+	[HideFromIl2Cpp]
+	internal void ModAgentSelectReasoning(string effort)
+	{
+		RunUiCallback("AgentReasoning", delegate
+		{
+			_callbacks.AgentReasoningSelectedRequested?.Invoke(effort);
+		});
+	}
+
+	[HideFromIl2Cpp]
+	internal void ModSelectSpeechService(bool enabled)
+	{
+		RunUiCallback("SpeechServiceEnabled", delegate
+		{
+			_speechCallbacks.SelectServiceEnabled?.Invoke(enabled);
+		});
+	}
+
+	[HideFromIl2Cpp]
+	internal void ModSelectSpeechLanguage(SpeechLanguage language)
+	{
+		RunUiCallback("SpeechLanguage", delegate
+		{
+			_speechCallbacks.SelectLanguage?.Invoke(language);
+		});
+	}
+
+	[HideFromIl2Cpp]
+	internal void ModSelectSpeechReference(string style)
+	{
+		RunUiCallback("SpeechReference", delegate
+		{
+			_speechCallbacks.SelectReference?.Invoke(style);
+		});
+	}
+
+	[HideFromIl2Cpp]
+	internal void ModOpenSystemPrompt()
+	{
+		RunUiCallback("OpenPersonality", delegate
+		{
+			_callbacks.OpenSystemPromptRequested?.Invoke();
+		});
+	}
+
+	[HideFromIl2Cpp]
+	internal void ModOpenJourneys()
+	{
+		RunUiCallback("OpenJourneys", OpenJourneyDialog);
+	}
+
+	[HideFromIl2Cpp]
+	internal void ModOpenDreamMemory()
+	{
+		RunUiCallback("OpenDreamMemory", OpenDreamMemoryFromLilith);
+	}
+
+	[HideFromIl2Cpp]
+	internal void ModOpenWorldBook()
+	{
+		RunUiCallback("OpenWorldBook", OpenWorldBookFromLilith);
+	}
+
+	[HideFromIl2Cpp]
+	internal void ModToggleHotkeyCapture()
+	{
+		try
+		{
+			if (_chatHotkey.IsCapturing)
+			{
+				_chatHotkey.CancelCapture();
+			}
+			else
+			{
+				_chatHotkey.BeginCapture();
+			}
+		}
+		catch (Exception error)
+		{
+			SafeLogCallbackError("ToggleHotkeyCapture", error);
+		}
+	}
+
+	/// <summary>
+	/// 把自建 API 设置面板挂进 MOD 页。旧的注入还开着（legacy=true）时不接管，
+	/// 避免和游戏本体设置页里的那份抢同一个面板。
+	/// </summary>
+	[HideFromIl2Cpp]
+	internal bool ModAttachApiPanel(Transform parent)
+	{
+		if (_legacyNativeInjection || _settingsPanel == null || parent == null)
+		{
+			return false;
+		}
+		try
+		{
+			Transform skinRoot = ResolveModSkinRoot();
+			if (skinRoot != null)
+			{
+				ApplyNativePageSkin(skinRoot);
+			}
+			_settingsPanel.transform.SetParent(parent, worldPositionStays: false);
+			_settingsPanel.transform.localScale = Vector3.one;
+			_settingsPanel.transform.localRotation = Quaternion.identity;
+			RectTransform rect = _settingsPanel.GetComponent<RectTransform>();
+			if (rect != null)
+			{
+				rect.anchorMin = new Vector2(0f, 1f);
+				rect.anchorMax = new Vector2(0f, 1f);
+				rect.pivot = new Vector2(0f, 1f);
+				rect.anchoredPosition = Vector2.zero;
+				rect.sizeDelta = new Vector2(436f, 390f);
+			}
+			SetLayerRecursively(_settingsPanel.transform, parent.gameObject.layer);
+			_settingsPanel.SetActive(value: true);
+			return true;
+		}
+		catch (Exception error)
+		{
+			SafeLogCallbackError("ModAttachApiPanel", error);
+			return false;
+		}
+	}
+
+	[HideFromIl2Cpp]
+	internal void ModReleaseApiPanel()
+	{
+		if (_settingsPanel == null)
+		{
+			return;
+		}
+		try
+		{
+			_settingsPanel.SetActive(value: false);
+			if (_settingsPanelHome != null)
+			{
+				_settingsPanel.transform.SetParent(_settingsPanelHome, worldPositionStays: false);
+				ResetSettingsOverlayRect(_settingsPanel.GetComponent<RectTransform>());
+			}
+		}
+		catch (Exception error)
+		{
+			SafeLogCallbackError("ModReleaseApiPanel", error);
+		}
+	}
+
+	/// <summary>
 	/// 打开独立的「MOD 设置」页。托盘项与人物右键项都只走这一个入口。
 	/// </summary>
 	[HideFromIl2Cpp]
@@ -2989,7 +3268,7 @@ public sealed class LlmConfigurationView : MonoBehaviour
 			EnsureModSettingsEntry();
 			if (_modSettings == null)
 			{
-				_modSettings = new ModSettingsWindow(_uiRoot.transform, _font, _log, ResolveModSkinRoot, TrackModSettingsInput, UntrackModSettingsInput);
+				_modSettings = new ModSettingsWindow(this, _uiRoot.transform, _font, _log);
 			}
 			_modSettings.Open();
 		}
@@ -3048,7 +3327,7 @@ public sealed class LlmConfigurationView : MonoBehaviour
 	/// Lilith 行注入之后那个根会没有。解析失败返回 null，页面降级成自绘深色皮肤照常打开。
 	/// </summary>
 	[HideFromIl2Cpp]
-	private Transform? ResolveModSkinRoot()
+	internal Transform? ResolveModSkinRoot()
 	{
 		Transform cached = _modSkinRoot;
 		if (cached != null && cached.parent != null)
@@ -3101,7 +3380,7 @@ public sealed class LlmConfigurationView : MonoBehaviour
 
 	/// <summary>把 MOD 页的输入框并进 _allInputs：键盘输入租约（TransparentWindowNew）与 F7 闸门都靠它。</summary>
 	[HideFromIl2Cpp]
-	private void TrackModSettingsInput(InputField field)
+	internal void TrackModSettingsInput(InputField field)
 	{
 		if (field != null && !_allInputs.Contains(field))
 		{
@@ -3110,7 +3389,7 @@ public sealed class LlmConfigurationView : MonoBehaviour
 	}
 
 	[HideFromIl2Cpp]
-	private void UntrackModSettingsInput(InputField field)
+	internal void UntrackModSettingsInput(InputField field)
 	{
 		if (field != null)
 		{

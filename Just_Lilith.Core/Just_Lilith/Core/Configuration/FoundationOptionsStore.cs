@@ -21,6 +21,14 @@ public static class FoundationOptionsStore
 		}
 		FoundationOptions? obj = JsonSerializer.Deserialize<FoundationOptions>(File.ReadAllText(path), JsonOptions) ?? throw new InvalidDataException("The foundation configuration is empty.");
 		Validate(obj);
+		// 手写配置里把 ui 段写成 null 时回落到默认值，不要因此让插件起不来。
+		if (obj.Ui == null)
+		{
+			obj = obj with
+			{
+				Ui = new FoundationUiOptions()
+			};
+		}
 		return obj;
 	}
 

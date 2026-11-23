@@ -28,6 +28,8 @@ public sealed class Plugin : BasePlugin
 
 	private MainThreadPump? _pump;
 
+	private bool _legacyNativeInjection = true;
+
 	private LlmConfigurationView? _view;
 
 	private LlmConfigurationController? _configuration;
@@ -92,6 +94,7 @@ public sealed class Plugin : BasePlugin
 		try
 		{
 			_lifetime = new CancellationTokenSource();
+			_legacyNativeInjection = foundationOptions.Ui.LegacyNativeInjection;
 			_pump = AddComponent<MainThreadPump>();
 			_pump.Configure(base.Log);
 			MainThreadReady = _pump.GetReadyTask();
@@ -139,6 +142,7 @@ public sealed class Plugin : BasePlugin
 				_view = AddComponent<LlmConfigurationView>();
 				_view.AttachLogger(base.Log);
 				_view.AttachGameBridge(_gameBridge);
+				_view.SetLegacyNativeInjection(_legacyNativeInjection);
 				try
 				{
 					_speech = new MainThreadSpeechController(_gameBridge, _view, Path.Combine(Paths.ConfigPath, "local.just_lilith.tts.json"), base.Log, new TtsServiceManager(new TtsServiceOptions(TtsRuntimeLocation.Resolve())));

@@ -360,7 +360,8 @@ static bool ShowOptionsPrefix(PlayerLineController __instance,
 
 - 托盘项在菜单建完约 0.6s 后追加，刚启动那一会儿立刻右键可能还看不到；之后一直在。
 - 插件卸载时 `UnpatchSelf()` 已做，但已经追加进 Win32 菜单的那一条不会被移除（进程退出即消失）。
-- 阶段 B 未开始：API/TTS/幻境/热键四块仍在游戏本体设置里，`legacyNativeInjection` 灰度开关、拆注入、回归都还没做。
+- 阶段 B 已完成（见下节）；旧注入的**代码**仍保留在仓库里，只是被 `ui.legacy_native_injection` 关掉，
+  想彻底删掉可以等 B 阶段真机验收稳定后再做。
 
 ### 复用到的 API 事实（补充）
 
@@ -369,4 +370,57 @@ static bool ShowOptionsPrefix(PlayerLineController __instance,
   （实测 `MenuItemData` 插进 `List<MenuItemData>` 后 `literalText` 回读失败，也没渲染出来）。
 - 给 `WindowsSystemTrayAdapter.AddItem` 挂**后缀**可以精确知道「游戏刚重建过菜单」，用来触发幂等追加；
   注意自己调 `AddItem` 也会经过这个后缀，必须加 `_appendInFlight` 挡自激（否则 0.5s 一次无限追加）。
+
+---
+
+## 阶段 B 实现状态（已完成）
+
+### 页内结构：左侧分组 + 右侧内容
+
+| 分组 | 内容 | 读写路径 |
+| --- | --- | --- |
+| 模型 / API | 三套 API 配置面板（把原来的 `_settingsPanel` 整体挂进来，左侧对齐、右侧给说明） | 原样复用 `LlmConfigurationController`，一行行点「保存」才写盘 |
+| Agent | Agent 状态、开关、Agent 人格、模型、推理、Agent 设置、取消当前对话 | 复用 `_callbacks.Agent*`；模型/推理点一下循环切换（不再需要原生行做锚点） |
+| 语音 / TTS | 服务开关、朗读语言、参考风格、服务状态 | 复用 `SpeechRadioSelection` + `SpeechUiCallbacks`（回调由 `MainThreadSpeechController` 注入） |
+| 对话与记忆 | 人格 Prompt / 幻境 / 幻境记忆 / 世界书 | 复用 `_callbacks.OpenSystemPromptRequested` 等 + 自建幻境对话框 |
+| 热键 | 唤出聊天框（点击录制，显示实时状态） | 复用 `ChatHotkeyController.BeginCapture/CancelCapture/RowText` |
+| 主动对话 | 开关 / 期望间隔 / 每条上限 + **兴趣值回显**「每轮约 X–Y 点 · 约 N 分钟掷中一次」 | `ProactiveSettingsStore` + `InterestModel.SolveIncrement/DescribeIncrement` |
+| 窥屏 | 开关 / 权重 / 视觉模型 / 最小间隔 / 每天上限 | 同上 |
+
+页面底部常驻：打开配置目录、重新载入、当前值回显（含配置文件路径与最后修改时间）、版本与旧注入状态。
+
+### 灰度开关与去污染
+
+- 基础项配置 `BepInEx/config/local.just_lilith.json` 新增（`FoundationOptions.Ui`）：
+  ```json
+  { "ui": { "legacy_native_injection": false } }
+  ```
+  **默认 false**：四个原生注入全部不建，游戏本体设置页保持原版。
+  改成 `true` 就回到改造前行为（旧注入照旧挂在游戏设置里），用于回退排查。
+- 关掉旧注入时做的清理：`SetLegacyNativeInjection(false)` 会立刻 detach TTS 行 / Lilith 行 / Agent 行、
+  把 `_settingsPanel` 收回 home、销毁 API 页签；热键行通过 `ChatHotkeyController.NativeInjectionEnabled`
+  传给 `NativeHotkeySettingsInjector.Enabled`，关闭后每帧 `Maintain()` 直接移除自己那行。
+- **聊天框皮肤不受影响**：`MaintainNativeApiTab()` 仍然每帧跑（只是里面看到 flag 就不再建页签），
+  所以 `native_chat_skin_applied` 照旧。
+
+### 实测（真机，只验日志，UI 由用户验收）
+
+- `legacy=false` 启动：`state=legacy_native_injection=false`、
+  `entry=native_api_settings_tab; state=native_injection_disabled`、
+  无 `native_language_tts` / `native_lilith_journeys` / `native_chat_hotkey_row` 任何一行；
+  `native_chat_skin_applied` 仍在。
+- `legacy=true` 启动（回退验证）：`state=legacy_native_injection=true`、
+  `native_api_settings_tab; state=mounted_hidden`、`native_chat_hotkey_row; state=awaiting_hotkeys_page` 都回来了。
+- `legacy=false` 打开 MOD 页：`state=skin_applied; buttons=28; inputs=5`、
+  `event=api_panel_attached`（三套 API 面板成功挂载），无异常。
+- 退出游戏后 `python.exe` 归零（TTS 清理未受影响）。
+
+### 踩坑（阶段 B 新增）
+
+- `LlmConfigurationView` 是注册进 il2cpp 的 MonoBehaviour：**凡是返回 Core 纯托管类型的属性都会被
+  Il2CppInterop 判成 `unsupported return type`**。改成 `[HideFromIl2Cpp]` 的方法（`GetModSpeechSettings` 等）即可。
+- `SpeechSettings` / `TtsServiceState` / `AgentUiState` 这类 Core 类型不要从 MonoBehaviour 上直接暴露成属性。
+- 把 `_settingsPanel` 挂进 MOD 页后，关闭页面必须 `ModReleaseApiPanel()` 收回去，
+  否则 `RestoreNativeSettingsView()` 那套状态会错位。
+
 

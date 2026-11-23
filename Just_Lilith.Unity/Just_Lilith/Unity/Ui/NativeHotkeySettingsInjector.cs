@@ -49,10 +49,18 @@ internal sealed class NativeHotkeySettingsInjector : IDisposable
 		_log = logger;
 	}
 
+	/// <summary>false = 热键行只出现在「MOD 设置」页里，游戏本体设置页不再插行。</summary>
+	public bool Enabled { get; set; } = true;
+
 	public void Maintain()
 	{
 		if (_disposed)
 		{
+			return;
+		}
+		if (!Enabled)
+		{
+			RemoveOwnedRow();
 			return;
 		}
 		if (_row != null)

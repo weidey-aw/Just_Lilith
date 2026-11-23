@@ -47,6 +47,19 @@ internal sealed class ChatHotkeyController : IDisposable
 
 	public bool IsCapturing => _capturing;
 
+	/// <summary>false = 热键行不再插进游戏本体设置页（改由「MOD 设置」页承载）。</summary>
+	public bool NativeInjectionEnabled
+	{
+		get
+		{
+			return _settingsInjector.Enabled;
+		}
+		set
+		{
+			_settingsInjector.Enabled = value;
+		}
+	}
+
 	public ChatHotkeyBinding Binding
 	{
 		get
