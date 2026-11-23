@@ -53,6 +53,9 @@ internal sealed class ModSettingsWindow
 
 	private const float NavHeight = 34f;
 
+	/// <summary>页面离桌面可视区边缘的最小留白（屏幕像素）。</summary>
+	private const float PlacementMargin = 10f;
+
 	private static readonly string[] NavLabels = new string[7] { "模型 / API", "Agent", "语音 / TTS", "对话与记忆", "热键", "主动对话", "窥屏" };
 
 	private static readonly Color PanelBackground = new Color(0.1f, 0.1f, 0.1f, 0.98f);
@@ -196,6 +199,10 @@ internal sealed class ModSettingsWindow
 
 	private float _nextStatusTick;
 
+	private float _nextPlacementTick;
+
+	private bool _placementLogged;
+
 	private bool _disposed;
 
 	internal ModSettingsWindow(LlmConfigurationView owner, Transform canvasRoot, Font font, ManualLogSource log)
@@ -238,7 +245,8 @@ internal sealed class ModSettingsWindow
 			_page.transform.SetAsLastSibling();
 			ShowGroup(_activeGroup);
 			RefreshWidgets();
-			Log("event=opened; path=" + _settingsPath + "; legacy_native_injection=" + Bool(_owner.LegacyNativeInjection));
+			PlaceOnVisibleArea(fresh: true);
+			Log("event=opened; path=" + _settingsPath + "; legacy_native_injection=" + Bool(_owner.LegacyNativeInjection) + "; pos=" + DescribePlacement());
 		}
 		catch (Exception error)
 		{
@@ -283,6 +291,11 @@ internal sealed class ModSettingsWindow
 				return;
 			}
 			RefreshLiveWidgets();
+			if (!_dragging && Time.unscaledTime >= _nextPlacementTick)
+			{
+				_nextPlacementTick = Time.unscaledTime + 0.3f;
+				PlaceOnVisibleArea(fresh: false);
+			}
 			if (Time.unscaledTime >= _nextStatusTick)
 			{
 				_nextStatusTick = Time.unscaledTime + 0.5f;
@@ -554,13 +567,19 @@ internal sealed class ModSettingsWindow
 		_peekDailyInput = CreateInput(group, "PeekDailyInput", "20", new Vector2(150f, -212f), new Vector2(90f, 30f), 4);
 		CreateText(group, "PeekDailyHint", "每天最多几次，0 = 不限制", 12, TextAnchor.MiddleLeft, new Vector2(252f, -212f), new Vector2(480f, 30f), FontStyle.Normal, Muted);
 		CreateButton(group, "SavePeek", "保存窥屏设置", new Vector2(0f, -256f), new Vector2(180f, 34f), SavePeek);
+		// T6：把耦合关系写在页面上，别再让人以为“单开窥屏”能生效。
+		Text coupling = CreateText(group, "PeekCoupling", "窥屏依附于主动对话开关：主动对话关着的时候，窥屏也不会触发。", 12, TextAnchor.UpperLeft, new Vector2(0f, -304f), new Vector2(ContentWidth, 44f), FontStyle.Normal, Warning);
+		coupling.horizontalOverflow = HorizontalWrapMode.Wrap;
+		coupling.verticalOverflow = VerticalWrapMode.Overflow;
 	}
 
 	private void BuildBottomBar(Transform parent)
 	{
 		CreateButton(parent, "OpenConfigFolder", "打开配置目录", new Vector2(20f, -704f), new Vector2(180f, 34f), OpenConfigFolder);
 		CreateButton(parent, "ReloadSettings", "重新载入", new Vector2(212f, -704f), new Vector2(120f, 34f), ReloadSettings);
-		_footerText = CreateText(parent, "ModFooter", "", 12, TextAnchor.MiddleLeft, new Vector2(350f, -704f), new Vector2(610f, 34f), FontStyle.Normal, Muted);
+		_footerText = CreateText(parent, "ModFooter", "", 12, TextAnchor.MiddleLeft, new Vector2(350f, -704f), new Vector2(490f, 34f), FontStyle.Normal, Muted);
+		// 第二个「关闭」：万一标题条被裁掉（窗口比屏幕高等情况），底部永远够得着。
+		CreateButton(parent, "CloseModSettingsBottom", "关闭", new Vector2(860f, -704f), new Vector2(90f, 34f), CloseFromButton);
 		_statusText = CreateText(parent, "ModStatus", "", 12, TextAnchor.UpperLeft, new Vector2(20f, -748f), new Vector2(940f, 40f), FontStyle.Normal, Color.white);
 		_statusText.horizontalOverflow = HorizontalWrapMode.Wrap;
 		_statusText.verticalOverflow = VerticalWrapMode.Overflow;
@@ -854,6 +873,11 @@ internal sealed class ModSettingsWindow
 		else
 		{
 			builder.Append(" · 视觉模型 ").Append(_settings.VisionProfileId.Trim());
+		}
+		if (_settings.Sources.Screen && !_settings.Enabled)
+		{
+			// T6：主动对话没开时，窥屏开关其实是空的，必须说出来。
+			builder.Append("（当前不会触发：主动对话未开启）");
 		}
 		builder.Append('\n').Append("配置：").Append(_settingsPath).Append("（").Append(Stamp()).Append("）");
 		if (!string.IsNullOrEmpty(_editStatus))
@@ -1477,16 +1501,54 @@ internal sealed class ModSettingsWindow
 		}
 		if (RectTransformUtility.ScreenPointToLocalPointInRectangle(canvasRect, Input.mousePosition, null, out Vector2 localPoint))
 		{
-			Vector2 vector = _dragStartPosition + localPoint - _dragStartPointer;
-			Rect rect = canvasRect.rect;
-			float halfWidth = _pageRect.rect.width / 2f;
-			float halfHeight = _pageRect.rect.height / 2f;
-			float minX = rect.xMin + halfWidth;
-			float maxX = rect.xMax - halfWidth;
-			float minY = rect.yMin + halfHeight;
-			float maxY = rect.yMax - halfHeight;
-			_pageRect.anchoredPosition = new Vector2((minX <= maxX) ? Mathf.Clamp(vector.x, minX, maxX) : rect.center.x, (minY <= maxY) ? Mathf.Clamp(vector.y, minY, maxY) : rect.center.y);
+			_pageRect.anchoredPosition = _dragStartPosition + localPoint - _dragStartPointer;
+			// 夹紧用桌面可视区，不是画布矩形：窗口比屏幕高时画布边界在屏幕外。
+			WindowWorkArea.Clamp(_pageRect, canvasRect, PlacementMargin);
 		}
+	}
+
+	/// <summary>
+	/// 把页面放到桌面可视区里：fresh=true 时居中，否则只做夹紧（拖动/窗口变化后用）。
+	/// </summary>
+	private void PlaceOnVisibleArea(bool fresh)
+	{
+		if (_pageRect == null || _canvasRoot == null)
+		{
+			return;
+		}
+		RectTransform canvasRect = _canvasRoot.GetComponent<RectTransform>();
+		if (canvasRect == null)
+		{
+			return;
+		}
+		try
+		{
+			if (fresh)
+			{
+				WindowWorkArea.CenterInVisible(_pageRect, canvasRect, PlacementMargin);
+			}
+			else if (WindowWorkArea.Clamp(_pageRect, canvasRect, PlacementMargin) && !_placementLogged)
+			{
+				_placementLogged = true;
+				Log("event=mod_window_clamped; pos=" + DescribePlacement());
+			}
+		}
+		catch (Exception error)
+		{
+			Log("state=placement_failed; error=" + error.GetType().Name);
+		}
+	}
+
+	private string DescribePlacement()
+	{
+		if (_pageRect == null)
+		{
+			return "-";
+		}
+		RectTransform canvasRect = _canvasRoot?.GetComponent<RectTransform>();
+		Vector2 size = WindowWorkArea.SizeInScreen(_pageRect, canvasRect);
+		Rect visible = WindowWorkArea.VisibleRect();
+		return "anchor=(" + _pageRect.anchoredPosition.x.ToString("0") + "," + _pageRect.anchoredPosition.y.ToString("0") + "); size_screen=(" + size.x.ToString("0") + "x" + size.y.ToString("0") + "); visible=(" + visible.xMin.ToString("0") + "," + visible.yMin.ToString("0") + " " + visible.width.ToString("0") + "x" + visible.height.ToString("0") + "); canvas=(" + Screen.width + "x" + Screen.height + ")";
 	}
 
 	// ---------------- 控件工厂 ----------------
