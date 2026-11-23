@@ -354,6 +354,12 @@ public sealed class LlmConfigurationView : MonoBehaviour
 
 	private ProactiveChatService? _proactive;
 
+	private ModSettingsWindow? _modSettings;
+
+	private ModSettingsMenuIntegration? _modMenu;
+
+	private Transform? _modSkinRoot;
+
 	/// <summary>聊天输入框是否正拿着焦点：主动对话投放闸门要用（用户在打字就别插嘴）。</summary>
 	internal bool IsChatInputFocused => _chatInput != null && _chatInput.isFocused;
 
@@ -630,6 +636,7 @@ public sealed class LlmConfigurationView : MonoBehaviour
 	{
 		_log = logger;
 		_chatHotkey.AttachLogger(logger);
+		EnsureModSettingsEntry();
 	}
 
 	[HideFromIl2Cpp]
@@ -807,6 +814,8 @@ public sealed class LlmConfigurationView : MonoBehaviour
 				MaintainNativeAgent();
 				MaintainNativeLilithConversations();
 				MaintainJourneyDialogDrag();
+				_modMenu?.Tick();
+				_modSettings?.Tick();
 				if (_chatPlacement != null)
 				{
 					_chatPlacement.HoldSteady = _chatInput != null && _chatInput.isFocused;
@@ -879,6 +888,7 @@ public sealed class LlmConfigurationView : MonoBehaviour
 		DetachLilithSpeechRows();
 		DetachLilithConversationRows();
 		DetachAgentRows();
+		DisposeModSettings();
 		RestoreBackgroundKeyboardPolling();
 		try
 		{
@@ -2954,6 +2964,157 @@ public sealed class LlmConfigurationView : MonoBehaviour
 		if (_journeyDialogStatus != null)
 		{
 			_journeyDialogStatus.text = value;
+		}
+	}
+
+	// ---------------- MOD 设置页（阶段 A） ----------------
+
+	/// <summary>
+	/// 打开独立的「MOD 设置」页。托盘项与人物右键项都只走这一个入口。
+	/// </summary>
+	[HideFromIl2Cpp]
+	internal void OpenModSettings()
+	{
+		if (_applicationQuitting || IsStopped)
+		{
+			return;
+		}
+		if (_uiRoot == null || _font == null)
+		{
+			SafeLogInfo("module=ModUI; state=open_skipped; reason=ui_root_or_font_missing");
+			return;
+		}
+		try
+		{
+			EnsureModSettingsEntry();
+			if (_modSettings == null)
+			{
+				_modSettings = new ModSettingsWindow(_uiRoot.transform, _font, _log, ResolveModSkinRoot, TrackModSettingsInput, UntrackModSettingsInput);
+			}
+			_modSettings.Open();
+		}
+		catch (Exception error)
+		{
+			SafeLogCallbackError("OpenModSettings", error);
+		}
+	}
+
+	[HideFromIl2Cpp]
+	private void EnsureModSettingsEntry()
+	{
+		if (_modMenu != null || _applicationQuitting || IsStopped)
+		{
+			return;
+		}
+		try
+		{
+			ModSettingsMenuIntegration integration = new ModSettingsMenuIntegration(_log, OpenModSettings);
+			_modMenu = integration;
+			integration.Install();
+		}
+		catch (Exception error)
+		{
+			SafeLogCallbackError("EnsureModSettingsEntry", error);
+		}
+	}
+
+	[HideFromIl2Cpp]
+	private void DisposeModSettings()
+	{
+		try
+		{
+			_modSettings?.Dispose();
+		}
+		catch (Exception error)
+		{
+			SafeLogCallbackError("DisposeModSettings.Window", error);
+		}
+		_modSettings = null;
+		try
+		{
+			_modMenu?.Dispose();
+		}
+		catch (Exception error)
+		{
+			SafeLogCallbackError("DisposeModSettings.Menu", error);
+		}
+		_modMenu = null;
+		_modSkinRoot = null;
+	}
+
+	/// <summary>
+	/// 独立解析「原版设置页的 item root」：<see cref="NativeTrayPageSkin"/> 只用它来找
+	/// <c>SettingPlanelPrefabs</c> 下的模板。刻意不依赖 <c>_lilithItemRoot</c>——阶段 B 拆掉
+	/// Lilith 行注入之后那个根会没有。解析失败返回 null，页面降级成自绘深色皮肤照常打开。
+	/// </summary>
+	[HideFromIl2Cpp]
+	private Transform? ResolveModSkinRoot()
+	{
+		Transform cached = _modSkinRoot;
+		if (cached != null && cached.parent != null)
+		{
+			return cached;
+		}
+		try
+		{
+			foreach (LocatedUnityObject located in UnityRuntimeObjectLocator.FindAll("UI.TraySettingNew.TraySettingNewView, Assembly-CSharp"))
+			{
+				RuntimeValueAccessor accessor = RuntimeValueAccessor.Find(located.ReflectedType, "_settingItemRoot");
+				if (accessor == null)
+				{
+					continue;
+				}
+				if (accessor.GetValue(located.Instance) is Transform root && root != null && root.parent != null && FindNamedChild(root.parent, "SettingPlanelPrefabs") != null)
+				{
+					_modSkinRoot = root;
+					return root;
+				}
+			}
+		}
+		catch (Exception error)
+		{
+			SafeLogInfo("module=ModUI; state=skin_root_error; error=" + error.GetType().Name);
+		}
+		return null;
+	}
+
+	private static Transform? FindNamedChild(Transform root, string name)
+	{
+		if (root == null)
+		{
+			return null;
+		}
+		if (string.Equals(root.name, name, StringComparison.Ordinal))
+		{
+			return root;
+		}
+		for (int i = 0; i < root.childCount; i++)
+		{
+			Transform found = FindNamedChild(root.GetChild(i), name);
+			if (found != null)
+			{
+				return found;
+			}
+		}
+		return null;
+	}
+
+	/// <summary>把 MOD 页的输入框并进 _allInputs：键盘输入租约（TransparentWindowNew）与 F7 闸门都靠它。</summary>
+	[HideFromIl2Cpp]
+	private void TrackModSettingsInput(InputField field)
+	{
+		if (field != null && !_allInputs.Contains(field))
+		{
+			_allInputs.Add(field);
+		}
+	}
+
+	[HideFromIl2Cpp]
+	private void UntrackModSettingsInput(InputField field)
+	{
+		if (field != null)
+		{
+			_allInputs.Remove(field);
 		}
 	}
 

@@ -2,8 +2,6 @@
 
 > 配套阅读：`docs/主动对话与窥屏-需求整理与可行性.md`（功能一/二已实现）、
 > `docs/handoff-下一步-主动对话.md`（历史交接风格）。
-> 参考实现：`docs/reference MOD/The-NOexistenceN-of-Lilith-Mod-main/`（第三方 Mod，**已 gitignore**，
-> 只当思路参考，不要整段复制进仓库）。
 
 ---
 
@@ -322,3 +320,53 @@ static bool ShowOptionsPrefix(PlayerLineController __instance,
   每次用之前重新取一次 `ShowSystemTray.instance`（托盘可能被销毁重建）。
 
 === 提示词结束 ===
+
+---
+
+## 实现状态（阶段 A 已落地，2026-11-23）
+
+真机验收跑过一轮，**入口按用户要求改成了「只保留托盘一个，且放最底下」**（原计划的「设置正下方」+「人物右键」暂不做）。
+
+### 交付
+
+| 文件 | 内容 |
+| --- | --- |
+| `Unity/Ui/ModSettingsWindow.cs`（新） | 「MOD 设置」页壳（深色面板 + 白色 2px Outline + 可拖动标题条 + Esc/关闭按钮）+ 主动对话/窥屏两组设置 + 打开配置目录 + 状态回显 |
+| `Unity/Ui/ModSettingsMenuIntegration.cs`（新） | 托盘入口：`AddSeparator()` + `AddItem("MOD设置")` 追加到菜单最底下；Harmony 静默检测重建（切语言/重进游戏）后自动补一次 |
+| `Unity/Ui/LlmConfigurationView.cs`（改） | `OpenModSettings()`、独立解析皮肤模板根、MOD 页输入框并进 `_allInputs`、`Update()` 里 tick、`CleanupOwnedUi()` 里 dispose |
+| `Unity/Plugin.cs` | **未改**（入口全部由 view 自己装配，`Dispose` 里 `UnpatchSelf()`） |
+
+页面内容（A4）：主动对话（总开关/期望间隔/每条上限）、窥屏（开关/权重/视觉模型/最小间隔/每天上限）、
+打开配置目录、重新载入、状态回显（当前值 + 配置文件路径与最后修改时间 + 视觉模型未配置提示）。
+读写直接走 `ProactiveSettingsStore`，服务按文件 mtime 热载入，**没有改服务代码**。
+
+### 与原提示词的差异（有意为之）
+
+- 托盘项**放在菜单最底下**（`[打开我的文件夹][呼唤莉莉丝][设置][再见][---][MOD设置]`），不做「设置正下方」。
+- **只有一个入口**：人物右键气泡的 `ShowOptions` 追加（A3）本轮未做，`OpenChatPanel` / `ShowOptions` 的 patch 也一并去掉了。
+
+### 实测记录（真机）
+
+- 托盘菜单 dump：`count=6; [0:打开我的文件夹][1:呼唤莉莉丝][2:设置][3:再见][4:---][5:MOD设置]`
+  —— 在底部、只有一条；切语言（`Settings` → `设置`）重建菜单后仍是唯一一条。
+- 点托盘项 → `module=ModUI; event=opened`；`state=skin_applied; templates=resolved; buttons=8; inputs=5`（原版皮肤贴上）。
+- 主动总开关：点一次 → 配置 `enabled` 翻转、`event=settings_saved`、服务侧 `state=settings_reloaded; enabled=1`（热载入生效）。
+- 视觉模型循环：`"" → profile-1 → profile-2 → profile-3 → ""`，显示为 `配置 1 (profile-1)`。
+- 数值校验：`期望间隔` 填 `5` 保存 → `state=edit_rejected; message=期望间隔：范围是 30–3600，当前 5`，不写盘。
+- 关闭：`event=closed; reason=button`；Esc 关闭记为 `reason=escape`；关掉后无残留面板挡点击。
+- 游戏本体设置未动（A 阶段本就没拆任何原生注入），页签/行数不变。
+
+### 已知限制 / 下一步
+
+- 托盘项在菜单建完约 0.6s 后追加，刚启动那一会儿立刻右键可能还看不到；之后一直在。
+- 插件卸载时 `UnpatchSelf()` 已做，但已经追加进 Win32 菜单的那一条不会被移除（进程退出即消失）。
+- 阶段 B 未开始：API/TTS/幻境/热键四块仍在游戏本体设置里，`legacyNativeInjection` 灰度开关、拆注入、回归都还没做。
+
+### 复用到的 API 事实（补充）
+
+- 托盘菜单是 `ShowSystemTray` 把 `menuItems` 逐条喂给 `ISystemTray.AddItem` 建出来的；
+  **运行时 `AddSeparator()` / `AddItem()` 会直接改 Win32 菜单**，比往 `menuItems` 里 `Insert` 可靠得多
+  （实测 `MenuItemData` 插进 `List<MenuItemData>` 后 `literalText` 回读失败，也没渲染出来）。
+- 给 `WindowsSystemTrayAdapter.AddItem` 挂**后缀**可以精确知道「游戏刚重建过菜单」，用来触发幂等追加；
+  注意自己调 `AddItem` 也会经过这个后缀，必须加 `_appendInFlight` 挡自激（否则 0.5s 一次无限追加）。
+
