@@ -263,9 +263,101 @@ public sealed class OpenAiCompatibleClient : IDisposable
 		return await SendCompletionAsync(settings, flag, dictionary, cancellationToken).ConfigureAwait(continueOnCapturedContext: false);
 	}
 
-	private async Task<string> SendCompletionAsync(LlmProfileSettings settings, bool isResponses, Dictionary<string, object> body, CancellationToken cancellationToken)
+	/// <summary>
+	/// 让视觉模型把一张 JPEG 转述成中文文字（窥屏方式 B：只拿文字，图不进对话历史）。
+	/// 与普通生成共用同一套 endpoint / 鉴权 / 回包解析；超时单独给（默认 20s）。
+	/// </summary>
+	public async Task<string> TranscribeImageAsync(LlmProfileSettings settings, string systemPrompt, string userPrompt, byte[] jpegBytes, TimeSpan timeout, CancellationToken cancellationToken = default(CancellationToken))
 	{
-		using JsonDocument jsonDocument = await SendAsync(settings, isResponses ? "responses" : "chat/completions", body, 8388608, TimeSpan.FromSeconds(120.0), cancellationToken).ConfigureAwait(continueOnCapturedContext: false);
+		ArgumentNullException.ThrowIfNull(settings, "settings");
+		ArgumentNullException.ThrowIfNull(jpegBytes, "jpegBytes");
+		if (jpegBytes.Length == 0 || jpegBytes.Length > 4194304)
+		{
+			throw new LlmException("image_size", "截图大小不正确；本轮窥屏取消。");
+		}
+		if (string.IsNullOrWhiteSpace(settings.ModelId) || settings.ModelId.Length > 256 || settings.ModelId.Any(char.IsControl))
+		{
+			throw new LlmException("model_required", "窥屏用的视觉模型未配置。");
+		}
+		if (!Enum.IsDefined(typeof(LlmApiFormat), settings.ApiFormat))
+		{
+			throw new LlmException("api_format", "请选择有效的 API 协议。");
+		}
+		if (!settings.IsConfigured)
+		{
+			throw new LlmException("model_required", "窥屏用的视觉模型未配置。");
+		}
+		string text = "data:image/jpeg;base64," + Convert.ToBase64String(jpegBytes);
+		bool flag = settings.ApiFormat == LlmApiFormat.Responses;
+		Dictionary<string, object> dictionary = new Dictionary<string, object>
+		{
+			["model"] = settings.ModelId,
+			["stream"] = false
+		};
+		if (flag)
+		{
+			dictionary["input"] = new object[1]
+			{
+				new Dictionary<string, object>
+				{
+					["role"] = "user",
+					["content"] = new object[2]
+					{
+						new Dictionary<string, object>
+						{
+							["type"] = "input_text",
+							["text"] = userPrompt
+						},
+						new Dictionary<string, object>
+						{
+							["type"] = "input_image",
+							["image_url"] = text
+						}
+					}
+				}
+			};
+			dictionary["store"] = false;
+			if (!string.IsNullOrEmpty(systemPrompt))
+			{
+				dictionary["instructions"] = systemPrompt;
+			}
+		}
+		else
+		{
+			List<object> list = new List<object>();
+			if (!string.IsNullOrEmpty(systemPrompt))
+			{
+				list.Add(new Dictionary<string, object>
+				{
+					["role"] = "system",
+					["content"] = systemPrompt
+				});
+			}
+			list.Add(new Dictionary<string, object>
+			{
+				["role"] = "user",
+				["content"] = new object[2]
+				{
+					new Dictionary<string, object>
+					{
+						["type"] = "text",
+						["text"] = userPrompt
+					},
+					new Dictionary<string, object>
+					{
+						["type"] = "image_url",
+						["image_url"] = new Dictionary<string, object> { ["url"] = text }
+					}
+				}
+			});
+			dictionary["messages"] = list;
+		}
+		return await SendCompletionAsync(settings, flag, dictionary, cancellationToken, timeout).ConfigureAwait(continueOnCapturedContext: false);
+	}
+
+	private async Task<string> SendCompletionAsync(LlmProfileSettings settings, bool isResponses, Dictionary<string, object> body, CancellationToken cancellationToken, TimeSpan? timeout = null)
+	{
+		using JsonDocument jsonDocument = await SendAsync(settings, isResponses ? "responses" : "chat/completions", body, 8388608, timeout ?? TimeSpan.FromSeconds(120.0), cancellationToken).ConfigureAwait(continueOnCapturedContext: false);
 		CheckApiError(jsonDocument.RootElement);
 		string text = NormalizeVisibleText(isResponses ? ParseResponses(jsonDocument.RootElement) : ParseChat(jsonDocument.RootElement)).Trim();
 		if (string.IsNullOrWhiteSpace(text))

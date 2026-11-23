@@ -1382,7 +1382,7 @@ public sealed class LlmConfigurationController : IDisposable
 	/// 失败只记日志（<c>module=Proactive; event=skipped</c>），不弹窗、不写 UI 错误。
 	/// <paramref name="onDone"/> 保证在主线程之外被恰好调用一次。
 	/// </summary>
-	internal void SendProactive(string instruction, Action<bool> onDone)
+	internal void SendProactive(string instruction, Action<bool> onDone, string? sourceTag = null)
 	{
 		if (Volatile.Read(ref _stopped) != 0 || _chatBusy || _connectionBusy)
 		{
@@ -1409,10 +1409,10 @@ public sealed class LlmConfigurationController : IDisposable
 		CancellationTokenSource operation = _chatCancellation;
 		long generation = Interlocked.Increment(ref _chatGeneration);
 		UpdateBusy();
-		SendProactiveAsync(activeProfile, _settings.Revision, instruction, generation, operation, onDone);
+		SendProactiveAsync(activeProfile, _settings.Revision, instruction, generation, operation, onDone, sourceTag);
 	}
 
-	private async Task SendProactiveAsync(LlmProfileSettings profile, long revision, string instruction, long generation, CancellationTokenSource operation, Action<bool> onDone)
+	private async Task SendProactiveAsync(LlmProfileSettings profile, long revision, string instruction, long generation, CancellationTokenSource operation, Action<bool> onDone, string? sourceTag)
 	{
 		bool ok = false;
 		try
@@ -1457,7 +1457,7 @@ public sealed class LlmConfigurationController : IDisposable
 						}
 					}
 				}).ConfigureAwait(continueOnCapturedContext: false);
-				LogProactiveCommitted(saved.Conversation.Revision, parsedReply.SpeechDiagnostic);
+				LogProactiveCommitted(saved.Conversation.Revision, parsedReply.SpeechDiagnostic, sourceTag);
 				ok = true;
 			}
 			catch (OperationCanceledException)
@@ -1501,6 +1501,120 @@ public sealed class LlmConfigurationController : IDisposable
 		}
 	}
 
+	/// <summary>
+	/// 窥屏转述（功能二方式 B）：把一张 JPEG 交给 <paramref name="visionProfileId"/> 指向的那套配置，
+	/// 拿回 ≤200 字的中文描述。与聊天共用 endpoint / 鉴权 / 回包解析，超时默认 20s。
+	/// <paramref name="onDone"/> 恰好回调一次；失败/超时/未配置都传 null（不弹窗、不刷 UI 错误）。
+	/// 截图与描述都不落盘，日志只记字符数。
+	/// </summary>
+	internal void TranscribeScreen(byte[] jpeg, string visionProfileId, int timeoutSeconds, Action<string?> onDone)
+	{
+		ArgumentNullException.ThrowIfNull(jpeg, "jpeg");
+		if (Volatile.Read(ref _stopped) != 0)
+		{
+			CompleteText(onDone, null);
+			return;
+		}
+		LlmProfileSettings? visionProfile = null;
+		if (!string.IsNullOrWhiteSpace(visionProfileId))
+		{
+			foreach (LlmProfileSettings profile in _settings.Profiles)
+			{
+				if (string.Equals(profile.ProfileId, visionProfileId.Trim(), StringComparison.Ordinal))
+				{
+					visionProfile = profile;
+					break;
+				}
+			}
+		}
+		if (visionProfile == null || !visionProfile.IsConfigured)
+		{
+			LogProactiveSkipped("vision_unconfigured");
+			CompleteText(onDone, null);
+			return;
+		}
+		TranscribeScreenAsync(visionProfile, jpeg, timeoutSeconds, onDone);
+	}
+
+	private async Task TranscribeScreenAsync(LlmProfileSettings visionProfile, byte[] jpeg, int timeoutSeconds, Action<string?> onDone)
+	{
+		string? description = null;
+		try
+		{
+			using CancellationTokenSource cancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+			string raw = await _client.TranscribeImageAsync(visionProfile, ScreenTranscribeSystemPrompt, ScreenTranscribeUserPrompt, jpeg, TimeSpan.FromSeconds(Math.Clamp(timeoutSeconds, 5, 60)), cancellation.Token).ConfigureAwait(continueOnCapturedContext: false);
+			description = NormalizeScreenDescription(raw);
+			if (description == null)
+			{
+				LogProactiveSkipped("peek_empty");
+			}
+			else
+			{
+				ManualLogSource log = _log;
+				if (log != null)
+				{
+					// 隐私：只记长度，绝不记画面描述本身。
+					log.LogInfo("module=Proactive; event=peek_transcribed; chars=" + description.Length + "; text_logged=false");
+				}
+			}
+		}
+		catch (OperationCanceledException)
+		{
+			LogProactiveSkipped("peek_cancelled");
+		}
+		catch (LlmException error)
+		{
+			LogProactiveSkipped("peek_failed; code=" + error.Code);
+		}
+		catch (Exception error2)
+		{
+			LogProactiveSkipped("peek_failed; code=" + error2.GetType().Name);
+		}
+		finally
+		{
+			CompleteText(onDone, description);
+		}
+	}
+
+	/// <summary>描述规整：压掉换行/多余空白，最多 200 字（与 SceneMemoryEntry.TextLimit 一致）。</summary>
+	private static string? NormalizeScreenDescription(string? raw)
+	{
+		if (string.IsNullOrWhiteSpace(raw))
+		{
+			return null;
+		}
+		string text = raw.Replace('\r', ' ').Replace('\n', ' ').Trim();
+		while (text.Contains("  ", StringComparison.Ordinal))
+		{
+			text = text.Replace("  ", " ", StringComparison.Ordinal);
+		}
+		if (text.Length > 200)
+		{
+			text = text.Substring(0, 200).TrimEnd();
+		}
+		return (text.Length == 0) ? null : text;
+	}
+
+	private static void CompleteText(Action<string?> onDone, string? text)
+	{
+		if (onDone == null)
+		{
+			return;
+		}
+		try
+		{
+			onDone(text);
+		}
+		catch (Exception)
+		{
+		}
+	}
+
+	// 转述提示词（2.4）：身份 + 授权说明 + 200 字 + 别描述本应用的聊天窗口。
+	private const string ScreenTranscribeSystemPrompt = "你是图像信息转述者，把看到的画面描述给另一个 AI。用户开放了那个 AI 的自主窥屏功能。抓重点，用中文写 200 字左右的一段话。如果看到聊天窗口、角色立绘和对话框，不要描述这部分，那是玩家与 AI 的聊天窗口。";
+
+	private const string ScreenTranscribeUserPrompt = "请转述这张截图。只写一段 200 字左右的中文描述：抓重点，不要分点、不要标题、不要代码围栏，不要推测画面之外的东西，也不要复述这段说明。";
+
 	private void LogProactiveSkipped(string reason)
 	{
 		ManualLogSource log = _log;
@@ -1510,12 +1624,12 @@ public sealed class LlmConfigurationController : IDisposable
 		}
 	}
 
-	private void LogProactiveCommitted(long revision, string? speechDiagnostic)
+	private void LogProactiveCommitted(long revision, string? speechDiagnostic, string? sourceTag)
 	{
 		ManualLogSource log = _log;
 		if (log != null)
 		{
-			log.LogInfo("module=Proactive; event=committed; source=idleChat; revision=" + revision + "; ambient=1; user_text=0; speech=" + ((speechDiagnostic == null) ? "ok" : "skipped"));
+			log.LogInfo("module=Proactive; event=committed; source=" + (string.IsNullOrEmpty(sourceTag) ? "idleChat" : sourceTag) + "; revision=" + revision + "; ambient=1; user_text=0; speech=" + ((speechDiagnostic == null) ? "ok" : "skipped"));
 		}
 	}
 

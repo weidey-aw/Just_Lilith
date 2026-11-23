@@ -43,6 +43,10 @@
       <HintPath>$(LilithBepInExDir)\interop\UnityEngine.AudioModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
+    <Reference Include="UnityEngine.ImageConversionModule">
+      <HintPath>$(LilithBepInExDir)\interop\UnityEngine.ImageConversionModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
     <Reference Include="UnityEngine.InputLegacyModule">
       <HintPath>$(LilithBepInExDir)\interop\UnityEngine.InputLegacyModule.dll</HintPath>
       <Private>False</Private>
