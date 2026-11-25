@@ -9,3 +9,4 @@ _screens/
 *.user
 BUILD.md
 _decomp/
+docs/dev

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "csharp-dev-tools": {
+      "command": "C:\\Users\\Administrator\\.csharp-dev-tools\\bin\\csdt-mcp.cmd",
+      "args": []
+    }
+  }
+}
