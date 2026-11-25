@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Reflection;
 using BepInEx.Logging;
 using HarmonyLib;
@@ -7,17 +8,25 @@ using UnityEngine;
 namespace Just_Lilith.Unity.Ui;
 
 /// <summary>
-/// 「MOD设置」的唯一入口（阶段 A）：系统托盘右键菜单最底下追加一项。
+/// 「MOD设置」的两个入口。
 ///
-/// 游戏托盘是真 Windows 通知区菜单 —— <c>ShowSystemTray</c> 把 <c>menuItems</c> 逐条喂给
-/// <c>ISystemTray.AddItem</c>，底层 <c>SystemTray</c> 用 <c>AppendMenuW</c> 建菜单，所以由游戏自己
-/// 加进去的项 100% 原生风格，不用我们画任何控件。
+/// 1. 系统托盘右键菜单：最底下追加一项。游戏托盘是真 Windows 通知区菜单 ——
+///    <c>ShowSystemTray</c> 把 <c>menuItems</c> 逐条喂给 <c>ISystemTray.AddItem</c>，
+///    底层 <c>SystemTray</c> 用 <c>AppendMenuW</c> 建菜单，所以由游戏自己加进去的项 100% 原生风格。
+///    做法：给 <c>WindowsSystemTrayAdapter.AddItem</c> 挂后缀，只用来记录「游戏刚重建过菜单」；
+///    等这批添加停下来（<see cref="SettleSeconds"/>）再 <c>AddSeparator()</c> + <c>AddItem(...)</c>。
+///    切语言、重进游戏都会重建菜单，所以每次重建后都会补一次，天然幂等。
 ///
-/// 做法：给 <c>WindowsSystemTrayAdapter.AddItem</c> 挂后缀，只用来记录「游戏刚重建过菜单」；
-/// 等这批添加停下来（<see cref="SettleSeconds"/>）再 <c>AddSeparator()</c> + <c>AddItem(...)</c>
-/// 追加到最底下。切语言、重进游戏都会重建菜单，所以每次重建后都会补一次，天然幂等。
+/// 2. 人物右键气泡菜单：在游戏「打开设置」那一项的正下方加一项。
+///    实测调用链：<c>HandleHookChatRequest → OpenChatPanel → PlayerLineController.Show
+///    → RefreshEntries</c>（组好 9 条并**直接**把按钮建完）<c>→ PlayerLineDatabase.GetRootEntries</c>。
+///    面板一页最多 <c>MaxOptionCount = 9</c> 项，而根菜单正好 9 项占满，上限又是只读的，
+///    所以插队进 <c>_currentEntries</c> 必然画不出来（也会被 <c>SetEntryContents</c> 按数据库校验丢掉）。
+///    这里的做法：<c>Show()</c> 之后用游戏自己的分页入口 <c>ShowEntryOptionsPaged</c> 重画一版
+///    「原 9 项 + MOD设置」，游戏自己渲染第 2 页，点原项仍然交回 <c>MarkEntryPicked</c> 执行。
+///    只在右键作用域内动手（<c>HandleHookChatRequest</c> 点亮），F7 打开聊天等路径完全不受影响。
 ///
-/// 入口只调 <see cref="LlmConfigurationView.OpenModSettings"/>，页面本身见 <see cref="ModSettingsWindow"/>。
+/// 两个入口都只调 <see cref="LlmConfigurationView.OpenModSettings"/>，页面本身见 <see cref="ModSettingsWindow"/>。
 /// </summary>
 internal sealed class ModSettingsMenuIntegration : IDisposable
 {
@@ -38,6 +47,9 @@ internal sealed class ModSettingsMenuIntegration : IDisposable
 	private static ModSettingsMenuIntegration _active;
 
 	private static Il2CppSystem.Action _trayActionNative;
+
+	/// <summary>气泡菜单里我们自己新增的条目 id（负数，避开游戏自己的 id）。</summary>
+	private const int BubbleEntryId = -9911;
 
 	private readonly ManualLogSource _log;
 
@@ -109,6 +121,16 @@ internal sealed class ModSettingsMenuIntegration : IDisposable
 			}
 			// 切语言会重建菜单：标记一次，等静默后重新追加。
 			TryPatch(trayType, "OnLocaleChanged", 1, "TrayLocalePostfix", ref ok, ref failed);
+			// 人物右键气泡菜单：在「打开设置」下方加一项。
+			// 实测链路 HandleHookChatRequest → OpenChatPanel → PlayerLineController.Show
+			//   → RefreshEntries（组好 9 条并直接建好按钮）→ GetRootEntries；
+			// 面板一页最多 MaxOptionCount=9 项且上限是只读的，根菜单正好占满，
+			// 所以 Show() 之后用游戏自己的分页入口重画一版：原 9 项 + 「MOD设置」。
+			Type lineType = ResolveType("PlayerLineController");
+			Type handlerType = ResolveType("CharacterInteractionHandler");
+			TryPatchPrefix(handlerType, "HandleHookChatRequest", 0, "HandleHookChatRequestPrefix", ref ok, ref failed);
+			TryPatch(lineType, "Show", 0, "ShowPostfix", ref ok, ref failed);
+			TryPatchPrefix(lineType, "MarkEntryPicked", 1, "MarkEntryPickedPrefix", ref ok, ref failed);
 		}
 		catch (Exception error)
 		{
@@ -310,6 +332,169 @@ internal sealed class ModSettingsMenuIntegration : IDisposable
 	{
 		_active?.OnEntrySelected();
 	}
+	
+	// ---------------- 人物右键气泡菜单 ----------------
+
+	/// <summary>点选回调：选中我们那条就开页面，其余的照旧透传。</summary>
+	private static bool MarkEntryPickedPrefix(PlayerLineEntry entry)
+	{
+		ModSettingsMenuIntegration integration = _active;
+		if (integration == null || integration._disposed)
+		{
+			return true;
+		}
+		try
+		{
+			if (entry == null || entry.id != BubbleEntryId)
+			{
+				return true;
+			}
+			integration.OpenFromBubble("MarkEntryPicked");
+			// 这个 id 在游戏数据库里不存在，别让它再走一次查找。
+			return false;
+		}
+		catch (Exception error)
+		{
+			integration.LogOnce("state=bubble_pick_failed; error=" + error.GetType().Name);
+			return true;
+		}
+	}
+
+	private static bool LooksLikeSettings(string text)
+	{
+		if (string.IsNullOrEmpty(text))
+		{
+			return false;
+		}
+		return text.IndexOf("设置", StringComparison.Ordinal) >= 0 || text.IndexOf("設定", StringComparison.Ordinal) >= 0 || text.IndexOf("Setting", StringComparison.OrdinalIgnoreCase) >= 0;
+	}
+
+	private void OpenFromBubble(string source)
+	{
+		if (_disposed)
+		{
+			return;
+		}
+		try
+		{
+			Log("event=entry_selected; source=bubble_" + source);
+			_open?.Invoke();
+		}
+		catch (Exception error)
+		{
+			Log("state=open_failed; source=bubble; error=" + error.GetType().Name + "; message=" + SingleLine(error.Message));
+		}
+	}
+
+	// ---------------- 右键气泡：换成「原 9 项 + MOD设置」 ----------------
+	//
+	// 实测链路：HandleHookChatRequest → OpenChatPanel → PlayerLineController.Show
+	//          → RefreshEntries（组好 9 条并直接建好按钮）→ GetRootEntries。
+	// 按钮建完后再往 _currentEntries 里插会被 SetEntryContents 按数据库校验丢掉，
+	// 所以沿用参考 mod 的做法：在 Show() 之后用游戏自己的 ShowOptions(IReadOnlyList<string>) 重画一版，
+	// 内容 = 原来 9 项的文字 + 「MOD设置」，点原来的项仍然交回 MarkEntryPicked 执行。
+
+	private static bool _rightClickScope;
+
+	/// <summary>点亮作用域那一帧；Show() 万一同帧没走到（被剧情之类挡住），隔两帧就作废。</summary>
+	private static int _rightClickFrame = -1;
+
+	private static Il2CppSystem.Action<PlayerLineEntry> _replacedEntryCallback;
+
+	/// <summary>右键请求：标记作用域，只处理紧接着那一次 Show()。</summary>
+	private static bool HandleHookChatRequestPrefix()
+	{
+		_rightClickScope = true;
+		_rightClickFrame = Time.frameCount;
+		_active?.LogOnce("event=right_click_scope");
+		return true;
+	}
+
+	/// <summary>Show() 之后把气泡列表换成「原项 + MOD设置」。</summary>
+	private static void ShowPostfix(PlayerLineController __instance)
+	{
+		ModSettingsMenuIntegration integration = _active;
+		if (integration == null || integration._disposed)
+		{
+			return;
+		}
+		if (!_rightClickScope)
+		{
+			return;
+		}
+		if (_rightClickFrame >= 0 && Time.frameCount - _rightClickFrame > 2)
+		{
+			// 这次右键最后没走 Show()（被剧情之类挡了），别去篡改下一次无关的菜单。
+			_rightClickScope = false;
+			_active?.LogOnce("state=bubble_scope_expired");
+			return;
+		}
+		_rightClickScope = false;
+		try
+		{
+			if (__instance == null)
+			{
+				return;
+			}
+			Il2CppSystem.Collections.Generic.List<PlayerLineEntry> current = __instance._currentEntries;
+			if (current == null || current.Count == 0)
+			{
+				integration.LogOnce("state=bubble_skipped; source=Show; reason=no_current_entries");
+				return;
+			}
+			int count = current.Count;
+			int settingsIndex = -1;
+			for (int i = 0; i < count; i++)
+			{
+				PlayerLineEntry item = current[i];
+				if (item != null && LooksLikeSettings(item.text))
+				{
+					settingsIndex = i;
+				}
+			}
+			if (settingsIndex < 0)
+			{
+				integration.LogOnce("state=bubble_skipped; source=Show; reason=no_settings_entry; count=" + count);
+				return;
+			}
+			// 气泡面板一页最多 MaxOptionCount=9 项，根菜单 9 项正好占满；上限是只读的，抬不动。
+			// 所以走游戏自己的分页入口 ShowEntryOptionsPaged：第 10 项落在第 2 页「打开设置」下面。
+			Il2CppSystem.Collections.Generic.List<PlayerLineEntry> entryList = new Il2CppSystem.Collections.Generic.List<PlayerLineEntry>();
+			for (int j = 0; j < count; j++)
+			{
+				entryList.Add(current[j]);
+			}
+			PlayerLineEntry ours = new PlayerLineEntry();
+			ours.id = BubbleEntryId;
+			ours.LineID = BubbleEntryId;
+			ours.viewLimit = 0;
+			ours.text = EntryLabel;
+			entryList.Add(ours);
+			Il2CppSystem.Action<PlayerLineEntry> entryCallback = (System.Action<PlayerLineEntry>)delegate(PlayerLineEntry picked)
+			{
+				if (picked != null && picked.id == BubbleEntryId)
+				{
+					integration.OpenFromBubble("ShowEntryOptionsPaged");
+					return;
+				}
+				try
+				{
+					PlayerLineController.MarkEntryPicked(picked);
+				}
+				catch (Exception error)
+				{
+					integration.LogOnce("state=bubble_pick_failed; error=" + error.GetType().Name);
+				}
+			};
+			_replacedEntryCallback = entryCallback;
+			__instance.ShowEntryOptionsPaged(entryList, entryCallback, 0);
+			integration.Log("event=bubble_menu_paged; count=" + entryList.Count + "; max=" + PlayerLineController.MaxOptionCount);
+		}
+		catch (Exception error)
+		{
+			integration.LogOnce("state=bubble_replace_failed; error=" + error.GetType().Name + "; message=" + SingleLine(error.Message));
+		}
+	}
 
 	// ---------------- Harmony 安装/工具 ----------------
 
@@ -338,8 +523,33 @@ internal sealed class ModSettingsMenuIntegration : IDisposable
 		}
 	}
 
-	private static MethodInfo FindMethod(Type type, string name, int parameterCount)
+	/// <summary>挂前缀补丁（气泡菜单用：要在原方法建按钮之前改列表）。</summary>
+	private bool TryPatchPrefix(Type type, string name, int arity, string patchName, ref int ok, ref int failed)
 	{
+		MethodInfo target = FindMethod(type, name, arity);
+		MethodInfo patch = typeof(ModSettingsMenuIntegration).GetMethod(patchName, BindingFlags.Static | BindingFlags.NonPublic);
+		if (target == null || patch == null)
+		{
+			failed++;
+			LogOnce("state=patch_skipped; target=" + name + ":" + arity + "; prefix=true; resolved=" + Bool(target != null) + "; patch=" + Bool(patch != null));
+			return false;
+		}
+		try
+		{
+			_harmony.Patch(target, new HarmonyMethod(patch), null, null, null, null);
+			_patched.Add(target);
+			ok++;
+			return true;
+		}
+		catch (Exception error)
+		{
+			failed++;
+			LogOnce("state=patch_failed; target=" + name + ":" + arity + "; prefix=true; error=" + error.GetType().Name + "; message=" + SingleLine(error.Message));
+			return false;
+		}
+	}
+
+	private static MethodInfo FindMethod(Type type, string name, int parameterCount)	{
 		if (type == null)
 		{
 			return null;
