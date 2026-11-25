@@ -1,87 +1,191 @@
 using System;
-using System.Reflection;
 using UnityEngine;
 
 namespace Just_Lilith.Unity.Ui;
 
 /// <summary>
-/// 把自建面板夹进「桌面上真正看得见的那块区域」。
+/// 把自建面板定位成「贴在桌面上的独立弹窗」，并提供游戏自带的「临时全屏」开关。
 ///
-/// 为什么要单独算：游戏的窗口是比屏幕还高的桌宠分层窗口（日志里 rect=(480,-120 960x1200)），
-/// 画布 = 窗口客户区，所以按画布中心居中时页面顶部会跑到屏幕外（「关闭」按钮点不到）。
-/// 这里用游戏自己的 <c>LilithWindow.CharacterWorkArea</c>（桌面像素，已排除任务栏）
-/// 经 <c>LilithWindow.DesktopToUnityScreen</c> 换算成「窗口屏幕坐标」，再与画布矩形求交，
-/// 得到一块一定在桌面上的矩形，所有定位 / 拖动夹紧都以它为准。
+/// 桌宠窗口本身比屏幕小、还会跟着角色挪（日志里 rect=(480,-120 960x1200)），
+/// 直接按画布坐标居中就会跑出屏幕。这里统一用桌面坐标：
+/// 1. 用 <c>LilithWindow.Rect</c>（窗口桌面矩形）∩ <c>LilithWindow.MonitorWorkAreaAt</c>
+///    （窗口所在显示器的工作区，已排除任务栏）得到「桌面上真正看得见的区域」——跟角色在哪无关；
+/// 2. 页面记住一个**桌面像素**中心点，靠 <c>DesktopToUnityScreen</c> 换回画布坐标，
+///    所以窗口怎么挪，页面在桌面上都不动；
+/// 3. 打不开时用游戏自己的 <c>RequestFullMonitor</c> 把窗口临时扩到整个显示器
+///    （引用计数、按 token 释放，关页面就还回去），这样画布就是从屏幕左上角到右下角。
 ///
-/// 坐标口径说明：
-/// - 外部拿到的可视矩形是**屏幕像素**；
-/// - 但所有比较都统一换到 `canvasRect` 的**局部坐标**里做（用
-///   <c>RectTransformUtility.ScreenPointToLocalPointInRectangle</c>），
-///   这样不用手工除 scaleFactor，也不用碰 <c>GetWorldCorners</c>
-///   （那个接口在 IL2CPP 下要传 <c>Il2CppStructArray</c>，传普通数组会静默拿到 0）。
-/// - 面板是画布的直接子节点、pivot 与 anchor 都在中心，所以它的中心就是 `anchoredPosition`。
+/// 所有夹紧都在画布局部坐标里算（<c>ScreenPointToLocalPointInRectangle</c>），
+/// 不碰 <c>GetWorldCorners</c>（IL2CPP 下传普通数组会静默拿到 0）。
 /// </summary>
 internal static class WindowWorkArea
 {
-	private const string WindowTypeName = "LilithWindow, Assembly-CSharp";
-
 	private const float DegenerateThreshold = 64f;
 
-	private static Type? _windowType;
+	/// <summary>最近一次定位失败的原因（只用于日志排查）。</summary>
+	internal static string LastDiagnostic { get; private set; } = "";
 
-	private static PropertyInfo? _workAreaProperty;
-
-	private static MethodInfo? _desktopToUnityScreen;
-
-	private static bool _resolved;
-
-	private static bool _failed;
+	private static void Fail(string reason)
+	{
+		LastDiagnostic = reason;
+	}
 
 	/// <summary>桌面可视区域在屏幕坐标里的矩形；取不到就退回整块画布。Fail-safe，不抛异常。</summary>
 	internal static Rect VisibleRect()
 	{
-		if (TryGetWorkAreaRect(out Rect workArea))
+		if (TryGetVisibleScreenRect(out Rect screenRect))
 		{
-			return workArea;
+			return screenRect;
 		}
 		return new Rect(0f, 0f, Mathf.Max(1f, Screen.width), Mathf.Max(1f, Screen.height));
 	}
 
-	/// <summary>只做换算，取不到返回 false（调用方自己决定退路）。</summary>
-	internal static bool TryGetWorkAreaRect(out Rect rect)
+	/// <summary>
+	/// 桌面上真正看得见的窗口区域：窗口矩形 ∩ 窗口所在显示器的工作区（桌面像素）。
+	/// 只跟窗口位置有关，跟角色在哪无关。
+	/// </summary>
+	internal static bool TryGetDesktopVisible(out RectInt visible)
 	{
-		rect = default(Rect);
+		visible = default(RectInt);
 		try
 		{
-			if (!EnsureResolved())
+			RectInt window = LilithWindow.Rect;
+			if (window.width <= 0 || window.height <= 0)
 			{
+				Fail("window_rect_invalid");
 				return false;
 			}
-			if (!(_workAreaProperty!.GetValue(null) is RectInt boxed))
+			Vector2 windowCenter = new Vector2(window.xMin + window.width * 0.5f, window.yMin + window.height * 0.5f);
+			RectInt area = LilithWindow.MonitorWorkAreaAt(windowCenter);
+			if (area.width <= 0 || area.height <= 0)
 			{
+				Fail("work_area_invalid");
 				return false;
 			}
-			// 左上 / 右下两个角换过来就是矩形；游戏窗口可能整个盖住屏幕，所以再和画布求交。
-			if (!TryToScreen(new Vector2(boxed.x, boxed.y), out Vector2 topLeft) || !TryToScreen(new Vector2(boxed.x + boxed.width, boxed.y + boxed.height), out Vector2 bottomRight))
+			int left = Mathf.Max(window.xMin, area.xMin);
+			int bottom = Mathf.Max(window.yMin, area.yMin);
+			int right = Mathf.Min(window.xMax, area.xMax);
+			int top = Mathf.Min(window.yMax, area.yMax);
+			if (right - left < DegenerateThreshold || top - bottom < DegenerateThreshold)
 			{
+				Fail("overlap_too_small; window=" + window.ToString() + "; area=" + area.ToString());
 				return false;
 			}
-			Rect mapped = Rect.MinMaxRect(Mathf.Min(topLeft.x, bottomRight.x), Mathf.Min(topLeft.y, bottomRight.y), Mathf.Max(topLeft.x, bottomRight.x), Mathf.Max(topLeft.y, bottomRight.y));
-			Rect canvasRect = new Rect(0f, 0f, Mathf.Max(1f, Screen.width), Mathf.Max(1f, Screen.height));
-			float xMin = Mathf.Max(mapped.xMin, canvasRect.xMin);
-			float yMin = Mathf.Max(mapped.yMin, canvasRect.yMin);
-			float xMax = Mathf.Min(mapped.xMax, canvasRect.xMax);
-			float yMax = Mathf.Min(mapped.yMax, canvasRect.yMax);
-			if (xMax - xMin < DegenerateThreshold || yMax - yMin < DegenerateThreshold)
-			{
-				return false;
-			}
-			rect = Rect.MinMaxRect(xMin, yMin, xMax, yMax);
+			visible = new RectInt(left, bottom, right - left, top - bottom);
 			return true;
 		}
-		catch
+		catch (Exception error)
+		{
+			Fail("desktop_visible_failed; " + error.GetType().Name);
+			return false;
+		}
+	}
+
+	/// <summary>桌面可视区中心（桌面像素）。页面打开时就以它为锚点。</summary>
+	internal static bool TryGetDesktopCenter(out Vector2 center)
+	{
+		center = default(Vector2);
+		if (!TryGetDesktopVisible(out RectInt visible))
 		{
 			return false;
+		}
+		center = new Vector2(visible.x + visible.width * 0.5f, visible.y + visible.height * 0.5f);
+		return true;
+	}
+
+	/// <summary>桌面像素点 → 画布局部坐标（页面中心就是 anchoredPosition）。</summary>
+	internal static bool TryDesktopToLocal(RectTransform canvasRect, Vector2 desktopPoint, out Vector2 local)
+	{
+		local = default(Vector2);
+		if (canvasRect == null)
+		{
+			return false;
+		}
+		try
+		{
+			Vector2 screen = LilithWindow.DesktopToUnityScreen(desktopPoint.x, desktopPoint.y);
+			return TryScreenToLocal(canvasRect, screen, out local);
+		}
+		catch (Exception error)
+		{
+			Fail("desktop_to_local_failed; " + error.GetType().Name);
+			return false;
+		}
+	}
+
+	/// <summary>画布局部坐标 → 桌面像素点（拖动后回写锚点用）。</summary>
+	internal static bool TryLocalToDesktop(RectTransform canvasRect, Vector2 local, out Vector2 desktopPoint)
+	{
+		desktopPoint = default(Vector2);
+		if (canvasRect == null)
+		{
+			return false;
+		}
+		try
+		{
+			Vector3 world = canvasRect.TransformPoint(new Vector3(local.x, local.y, 0f));
+			Vector2 screen = RectTransformUtility.WorldToScreenPoint(null, world);
+			desktopPoint = LilithWindow.UnityScreenToDesktop(screen.x, screen.y);
+			return true;
+		}
+		catch (Exception error)
+		{
+			Fail("local_to_desktop_failed; " + error.GetType().Name);
+			return false;
+		}
+	}
+
+	/// <summary>
+	/// 临时把游戏窗口扩到整个显示器（游戏自带、按 token 引用计数；token 一般是我们的页面对象，
+	/// 页面销毁就自动失效）。关页面时用同一个 token 调 <see cref="ReleaseFullMonitor"/> 还回去。
+	/// </summary>
+	internal static bool RequestFullMonitor(UnityEngine.Object token)
+	{
+		if (token == null)
+		{
+			return false;
+		}
+		try
+		{
+			LilithWindow.RequestFullMonitor(token, 0f);
+			return true;
+		}
+		catch (Exception error)
+		{
+			Fail("request_full_monitor_failed; " + error.GetType().Name);
+			return false;
+		}
+	}
+
+	internal static void ReleaseFullMonitor(UnityEngine.Object token)
+	{
+		if (token == null)
+		{
+			return;
+		}
+		try
+		{
+			LilithWindow.ReleaseFullMonitor(token);
+		}
+		catch (Exception error)
+		{
+			Fail("release_full_monitor_failed; " + error.GetType().Name);
+		}
+	}
+
+	/// <summary>当前是否已经拿着全屏（用于日志/判断要不要重新居中）。</summary>
+	internal static bool FullMonitorRequested
+	{
+		get
+		{
+			try
+			{
+				return LilithWindow.FullMonitorRequested;
+			}
+			catch (Exception)
+			{
+				return false;
+			}
 		}
 	}
 
@@ -133,7 +237,6 @@ internal static class WindowWorkArea
 		{
 			return Vector2.zero;
 		}
-		// 1 屏幕像素对应多少局部单位，倒数就是缩放。
 		float unitsPerPixelX = Mathf.Abs(b.x - a.x);
 		float unitsPerPixelY = Mathf.Abs(b.y - a.y);
 		if (unitsPerPixelX <= 0.0001f || unitsPerPixelY <= 0.0001f)
@@ -158,7 +261,27 @@ internal static class WindowWorkArea
 		return new Vector2(x, y);
 	}
 
-	/// <summary>可视区（屏幕像素）换到画布局部坐标。</summary>
+	/// <summary>桌面可视区（桌面像素）→ 屏幕坐标矩形。</summary>
+	private static bool TryGetVisibleScreenRect(out Rect screenRect)
+	{
+		screenRect = default(Rect);
+		if (!TryGetDesktopVisible(out RectInt visible))
+		{
+			return false;
+		}
+		try
+		{
+			screenRect = LilithWindow.DesktopRectToUnityScreen(visible);
+			return screenRect.width >= DegenerateThreshold && screenRect.height >= DegenerateThreshold;
+		}
+		catch (Exception error)
+		{
+			Fail("desktop_rect_to_screen_failed; " + error.GetType().Name);
+			return false;
+		}
+	}
+
+	/// <summary>桌面可视区（屏幕坐标）换到画布局部坐标。</summary>
 	private static bool TryGetVisibleLocalRect(RectTransform canvasRect, out Rect local)
 	{
 		local = default(Rect);
@@ -180,59 +303,6 @@ internal static class WindowWorkArea
 		}
 		catch
 		{
-			return false;
-		}
-	}
-
-	private static bool TryToScreen(Vector2 desktopPoint, out Vector2 screenPoint)
-	{
-		screenPoint = default(Vector2);
-		try
-		{
-			if (_desktopToUnityScreen == null)
-			{
-				return false;
-			}
-			object? result = _desktopToUnityScreen.Invoke(null, new object[2] { desktopPoint.x, desktopPoint.y });
-			if (result is Vector2 vector)
-			{
-				screenPoint = vector;
-				return true;
-			}
-		}
-		catch
-		{
-		}
-		return false;
-	}
-
-	private static bool EnsureResolved()
-	{
-		if (_resolved)
-		{
-			return !_failed;
-		}
-		_resolved = true;
-		try
-		{
-			_windowType = Type.GetType(WindowTypeName, throwOnError: false);
-			if (_windowType == null)
-			{
-				_failed = true;
-				return false;
-			}
-			_workAreaProperty = _windowType.GetProperty("CharacterWorkArea", BindingFlags.Static | BindingFlags.Public);
-			_desktopToUnityScreen = _windowType.GetMethod("DesktopToUnityScreen", BindingFlags.Static | BindingFlags.Public, null, new Type[2] { typeof(float), typeof(float) }, null);
-			if (_workAreaProperty == null || _desktopToUnityScreen == null)
-			{
-				_failed = true;
-				return false;
-			}
-			return true;
-		}
-		catch
-		{
-			_failed = true;
 			return false;
 		}
 	}

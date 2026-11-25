@@ -201,7 +201,41 @@ internal sealed class ModSettingsWindow
 
 	private float _nextPlacementTick;
 
+	/// <summary>页面中心钉在桌面上哪个点（桌面像素）。窗口跟着角色挪时靠它保持不动。</summary>
+	private Vector2 _desktopCenter;
+
+	private bool _hasDesktopCenter;
+
 	private bool _placementLogged;
+
+	private bool _fallbackLogged;
+
+	/// <summary>桌面锚点算不出来时只记一次原因，方便排查（正常情况不该出现）。</summary>
+	private void LogOncePlacementFallback(string reason)
+	{
+		if (_fallbackLogged)
+		{
+			return;
+		}
+		_fallbackLogged = true;
+		Log("state=placement_fallback; reason=" + ((string.IsNullOrEmpty(reason)) ? "-" : reason));
+	}
+
+	/// <summary>是否正拿着游戏的全屏窗口（关闭页面时还回去）。</summary>
+	private bool _fullMonitorHeld;
+
+	/// <summary>页面 GameObject 当全屏 token：页面被销毁时游戏那边会自动失效。</summary>
+	private GameObject _fullMonitorToken;
+
+	/// <summary>窗口正在扩成全屏，这段时间内容器尺寸会变，页面每个 tick 重新居中一次。</summary>
+	private float _recenterUntil = -1f;
+
+	/// <summary>用户手动拖过之后就不再自动居中（仍然会夹进可视区）。</summary>
+	private bool _userMoved;
+
+	private bool _hasLastVisible;
+
+	private RectInt _lastVisible;
 
 	private bool _disposed;
 
@@ -245,6 +279,7 @@ internal sealed class ModSettingsWindow
 			_page.transform.SetAsLastSibling();
 			ShowGroup(_activeGroup);
 			RefreshWidgets();
+			RequestFullMonitorForPage();
 			PlaceOnVisibleArea(fresh: true);
 			Log("event=opened; path=" + _settingsPath + "; legacy_native_injection=" + Bool(_owner.LegacyNativeInjection) + "; pos=" + DescribePlacement());
 		}
@@ -260,6 +295,7 @@ internal sealed class ModSettingsWindow
 		_dragging = false;
 		_dragHeader = null;
 		ReleaseApiPanel();
+		ReleaseFullMonitorForPage();
 		if (_page != null)
 		{
 			ClearOwnSelection();
@@ -269,6 +305,44 @@ internal sealed class ModSettingsWindow
 		{
 			Log("event=closed; reason=" + reason);
 		}
+	}
+
+	/// <summary>
+	/// 打开时把游戏窗口临时扩到整个显示器（游戏自带 RequestFullMonitor，按 token 引用计数）。
+	/// 这样画布不再被桌宠窗口的尺寸限制，弹窗可以摆在屏幕任意位置。
+	/// </summary>
+	private void RequestFullMonitorForPage()
+	{
+		if (_fullMonitorHeld || _page == null)
+		{
+			return;
+		}
+		_userMoved = false;
+		_fullMonitorToken = _page;
+		_fullMonitorHeld = WindowWorkArea.RequestFullMonitor(_page);
+		// 窗口扩到全屏后画布尺寸会变，留一秒让页面跟着重新居中到屏幕正中。
+		_recenterUntil = Time.unscaledTime + 1f;
+		if (_fullMonitorHeld)
+		{
+			Log("event=full_monitor_requested; requested=" + Bool(WindowWorkArea.FullMonitorRequested));
+		}
+		else
+		{
+			Log("state=full_monitor_unavailable; reason=" + WindowWorkArea.LastDiagnostic);
+		}
+	}
+
+	private void ReleaseFullMonitorForPage()
+	{
+		if (!_fullMonitorHeld)
+		{
+			return;
+		}
+		_fullMonitorHeld = false;
+		WindowWorkArea.ReleaseFullMonitor(_fullMonitorToken);
+		_fullMonitorToken = null;
+		_recenterUntil = -1f;
+		Log("event=full_monitor_released");
 	}
 
 	private void CloseFromButton()
@@ -293,8 +367,9 @@ internal sealed class ModSettingsWindow
 			RefreshLiveWidgets();
 			if (!_dragging && Time.unscaledTime >= _nextPlacementTick)
 			{
-				_nextPlacementTick = Time.unscaledTime + 0.3f;
-				PlaceOnVisibleArea(fresh: false);
+				// 10 次/秒按桌面锚点复定位：窗口（桌宠）跟着角色挪的时候，页面在屏幕上不跟着跑。
+				_nextPlacementTick = Time.unscaledTime + 0.1f;
+				ApplyDesktopAnchor();
 			}
 			if (Time.unscaledTime >= _nextStatusTick)
 			{
@@ -318,6 +393,7 @@ internal sealed class ModSettingsWindow
 		_dragging = false;
 		ClearOwnSelection();
 		ReleaseApiPanel();
+		ReleaseFullMonitorForPage();
 		foreach (InputField input in _inputs)
 		{
 			_owner.UntrackModSettingsInput(input);
@@ -579,8 +655,6 @@ internal sealed class ModSettingsWindow
 		CreateButton(parent, "OpenConfigFolder", "打开配置目录", new Vector2(20f, -704f), new Vector2(180f, 34f), OpenConfigFolder);
 		CreateButton(parent, "ReloadSettings", "重新载入", new Vector2(212f, -704f), new Vector2(120f, 34f), ReloadSettings);
 		_footerText = CreateText(parent, "ModFooter", "", 12, TextAnchor.MiddleLeft, new Vector2(350f, -704f), new Vector2(490f, 34f), FontStyle.Normal, Muted);
-		// 第二个「关闭」：万一标题条被裁掉（窗口比屏幕高等情况），底部永远够得着。
-		CreateButton(parent, "CloseModSettingsBottom", "关闭", new Vector2(860f, -704f), new Vector2(90f, 34f), CloseFromButton);
 		_statusText = CreateText(parent, "ModStatus", "", 12, TextAnchor.UpperLeft, new Vector2(20f, -748f), new Vector2(940f, 40f), FontStyle.Normal, Color.white);
 		_statusText.horizontalOverflow = HorizontalWrapMode.Wrap;
 		_statusText.verticalOverflow = VerticalWrapMode.Overflow;
@@ -1512,6 +1586,7 @@ internal sealed class ModSettingsWindow
 			}
 			_dragStartPosition = _pageRect.anchoredPosition;
 			_dragging = true;
+			_userMoved = true;
 			_pageRect.SetAsLastSibling();
 		}
 		if (RectTransformUtility.ScreenPointToLocalPointInRectangle(canvasRect, Input.mousePosition, null, out Vector2 localPoint))
@@ -1519,11 +1594,74 @@ internal sealed class ModSettingsWindow
 			_pageRect.anchoredPosition = _dragStartPosition + localPoint - _dragStartPointer;
 			// 夹紧用桌面可视区，不是画布矩形：窗口比屏幕高时画布边界在屏幕外。
 			WindowWorkArea.Clamp(_pageRect, canvasRect, PlacementMargin);
+			// 拖到哪就把桌面锚点记到哪，松手后依然钉在这块屏幕上。
+			if (WindowWorkArea.TryLocalToDesktop(canvasRect, _pageRect.anchoredPosition, out Vector2 desktop))
+			{
+				_desktopCenter = desktop;
+				_hasDesktopCenter = true;
+			}
 		}
 	}
 
 	/// <summary>
-	/// 把页面放到桌面可视区里：fresh=true 时居中，否则只做夹紧（拖动/窗口变化后用）。
+	/// 把页面钉在桌面锚点上：锚点是**桌面像素**，每帧换回画布坐标，
+	/// 所以窗口（桌宠）跟着角色挪动时，页面在屏幕上保持不动；同时夹进桌面可视区。
+	/// 返回 false 表示换算不可用（调用方退回到画布夹紧）。
+	/// </summary>
+	private bool ApplyDesktopAnchor()
+	{
+		if (_pageRect == null || _canvasRoot == null)
+		{
+			return false;
+		}
+		RectTransform canvasRect = _canvasRoot.GetComponent<RectTransform>();
+		if (canvasRect == null)
+		{
+			return false;
+		}
+		if (!_hasDesktopCenter && WindowWorkArea.TryGetDesktopCenter(out Vector2 center))
+		{
+			_desktopCenter = center;
+			_hasDesktopCenter = true;
+		}
+		// 窗口尺寸变了（典型是刚 RequestFullMonitor 扩成全屏）：扩屏期间每 tick 重新居中，
+		// 让弹窗跟着落到屏幕正中；用户手动拖过之后就不再自动挪。
+		if (WindowWorkArea.TryGetDesktopVisible(out RectInt visible))
+		{
+			if (!_hasLastVisible || visible.x != _lastVisible.x || visible.y != _lastVisible.y || visible.width != _lastVisible.width || visible.height != _lastVisible.height)
+			{
+				_lastVisible = visible;
+				_hasLastVisible = true;
+			}
+			if (Time.unscaledTime < _recenterUntil && !_userMoved)
+			{
+				_desktopCenter = new Vector2(visible.x + visible.width * 0.5f, visible.y + visible.height * 0.5f);
+				_hasDesktopCenter = true;
+			}
+		}
+		if (!_hasDesktopCenter || !WindowWorkArea.TryDesktopToLocal(canvasRect, _desktopCenter, out Vector2 local))
+		{
+			return false;
+		}
+		_pageRect.anchoredPosition = local;
+		if (WindowWorkArea.Clamp(_pageRect, canvasRect, PlacementMargin))
+		{
+			// 被夹过说明锚点已经贴边：反向回写，免得下一帧又弹回去、来回抖。
+			if (WindowWorkArea.TryLocalToDesktop(canvasRect, _pageRect.anchoredPosition, out Vector2 clampedDesktop))
+			{
+				_desktopCenter = clampedDesktop;
+			}
+			if (!_placementLogged)
+			{
+				_placementLogged = true;
+				Log("event=mod_window_clamped; pos=" + DescribePlacement());
+			}
+		}
+		return true;
+	}
+
+	/// <summary>
+	/// 把页面放到桌面可视区里：fresh=true 时居中（屏幕中心），否则只按已有锚点复定位。
 	/// </summary>
 	private void PlaceOnVisibleArea(bool fresh)
 	{
@@ -1540,7 +1678,22 @@ internal sealed class ModSettingsWindow
 		{
 			if (fresh)
 			{
+				// 打开时居中到桌面可视区中心（窗口盖住屏幕中心时就是屏幕正中）。
+				if (WindowWorkArea.TryGetDesktopCenter(out Vector2 center))
+				{
+					_desktopCenter = center;
+					_hasDesktopCenter = true;
+					if (ApplyDesktopAnchor())
+					{
+						return;
+					}
+				}
+				_hasDesktopCenter = false;
 				WindowWorkArea.CenterInVisible(_pageRect, canvasRect, PlacementMargin);
+				LogOncePlacementFallback(WindowWorkArea.LastDiagnostic);
+			}
+			else if (ApplyDesktopAnchor())
+			{
 			}
 			else if (WindowWorkArea.Clamp(_pageRect, canvasRect, PlacementMargin) && !_placementLogged)
 			{
