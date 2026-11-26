@@ -11,3 +11,5 @@ BUILD.md
 _decomp/
 docs/dev
 .vscode
+build.ps1
+.mcp.json
