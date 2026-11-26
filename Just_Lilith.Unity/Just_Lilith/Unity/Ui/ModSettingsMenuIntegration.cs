@@ -18,13 +18,16 @@ namespace Just_Lilith.Unity.Ui;
 ///    切语言、重进游戏都会重建菜单，所以每次重建后都会补一次，天然幂等。
 ///
 /// 2. 人物右键气泡菜单：在游戏「打开设置」那一项的正下方加一项。
-///    实测调用链：<c>HandleHookChatRequest → OpenChatPanel → PlayerLineController.Show
+///    实测调用链：<c>OpenChatPanel → PlayerLineController.Show
 ///    → RefreshEntries</c>（组好 9 条并**直接**把按钮建完）<c>→ PlayerLineDatabase.GetRootEntries</c>。
+///    右键有两条入口：单击穿透开着走全局钩子 <c>HandleHookChatRequest</c>，关着走 Unity 正常输入
+///    <c>HandleMouseUp</c>，最后都落到 <c>OpenChatPanel</c> —— 所以这两处都点亮作用域，
+///    <c>Show()</c> 之后再按「最后一项是不是设置项」兜底，两种模式表现一致。
 ///    面板一页最多 <c>MaxOptionCount = 9</c> 项，而根菜单正好 9 项占满，上限又是只读的，
 ///    所以插队进 <c>_currentEntries</c> 必然画不出来（也会被 <c>SetEntryContents</c> 按数据库校验丢掉）。
 ///    这里的做法：<c>Show()</c> 之后用游戏自己的分页入口 <c>ShowEntryOptionsPaged</c> 重画一版
 ///    「原 9 项 + MOD设置」，游戏自己渲染第 2 页，点原项仍然交回 <c>MarkEntryPicked</c> 执行。
-///    只在右键作用域内动手（<c>HandleHookChatRequest</c> 点亮），F7 打开聊天等路径完全不受影响。
+///    F7 打开聊天等不经过 <c>Show()</c> 的路径完全不受影响。
 ///
 /// 两个入口都只调 <see cref="LlmConfigurationView.OpenModSettings"/>，页面本身见 <see cref="ModSettingsWindow"/>。
 /// </summary>
@@ -128,7 +131,12 @@ internal sealed class ModSettingsMenuIntegration : IDisposable
 			// 所以 Show() 之后用游戏自己的分页入口重画一版：原 9 项 + 「MOD设置」。
 			Type lineType = ResolveType("PlayerLineController");
 			Type handlerType = ResolveType("CharacterInteractionHandler");
-			TryPatchPrefix(handlerType, "HandleHookChatRequest", 0, "HandleHookChatRequestPrefix", ref ok, ref failed);
+			// 右键两条入口都要认：
+			//  - 单击穿透开着时走全局钩子 HandleHookChatRequest；
+			//  - 单击穿透关着时走 Unity 正常输入 HandleMouseUp，最后一样落到 OpenChatPanel。
+			// 所以钩子和 OpenChatPanel 都点一下作用域，Show() 后面再按「菜单里有没有设置项」兜底。
+			TryPatchPrefix(handlerType, "HandleHookChatRequest", 0, "ArmRightClickScopePrefix", ref ok, ref failed);
+			TryPatchPrefix(handlerType, "OpenChatPanel", 0, "ArmRightClickScopePrefix", ref ok, ref failed);
 			TryPatch(lineType, "Show", 0, "ShowPostfix", ref ok, ref failed);
 			TryPatchPrefix(lineType, "MarkEntryPicked", 1, "MarkEntryPickedPrefix", ref ok, ref failed);
 		}
@@ -402,7 +410,7 @@ internal sealed class ModSettingsMenuIntegration : IDisposable
 	private static Il2CppSystem.Action<PlayerLineEntry> _replacedEntryCallback;
 
 	/// <summary>右键请求：标记作用域，只处理紧接着那一次 Show()。</summary>
-	private static bool HandleHookChatRequestPrefix()
+	private static bool ArmRightClickScopePrefix()
 	{
 		_rightClickScope = true;
 		_rightClickFrame = Time.frameCount;
@@ -418,11 +426,8 @@ internal sealed class ModSettingsMenuIntegration : IDisposable
 		{
 			return;
 		}
-		if (!_rightClickScope)
-		{
-			return;
-		}
-		if (_rightClickFrame >= 0 && Time.frameCount - _rightClickFrame > 2)
+		bool armed = _rightClickScope;
+		if (armed && _rightClickFrame >= 0 && Time.frameCount - _rightClickFrame > 2)
 		{
 			// 这次右键最后没走 Show()（被剧情之类挡了），别去篡改下一次无关的菜单。
 			_rightClickScope = false;
@@ -443,11 +448,24 @@ internal sealed class ModSettingsMenuIntegration : IDisposable
 				return;
 			}
 			int count = current.Count;
+			int settingsId = 0;
+			try
+			{
+				settingsId = PlayerLineController.SettingsEntryId;
+			}
+			catch (Exception)
+			{
+				settingsId = 0;
+			}
 			int settingsIndex = -1;
 			for (int i = 0; i < count; i++)
 			{
 				PlayerLineEntry item = current[i];
-				if (item != null && LooksLikeSettings(item.text))
+				if (item == null)
+				{
+					continue;
+				}
+				if ((settingsId != 0 && item.id == settingsId) || LooksLikeSettings(item.text))
 				{
 					settingsIndex = i;
 				}
@@ -455,6 +473,14 @@ internal sealed class ModSettingsMenuIntegration : IDisposable
 			if (settingsIndex < 0)
 			{
 				integration.LogOnce("state=bubble_skipped; source=Show; reason=no_settings_entry; count=" + count);
+				return;
+			}
+			// 作用域没点亮时的兜底：只有「最后一项就是设置项」才认成交互根菜单
+			// （单击穿透关闭走的是 Unity 正常输入，未必经过上面两个入口）。
+			bool settingsLast = settingsIndex == count - 1;
+			if (!armed && !settingsLast)
+			{
+				integration.LogOnce("state=bubble_skipped; source=Show; reason=not_root_menu; count=" + count + "; settings_index=" + settingsIndex);
 				return;
 			}
 			// 气泡面板一页最多 MaxOptionCount=9 项，根菜单 9 项正好占满；上限是只读的，抬不动。
