@@ -622,6 +622,9 @@ internal sealed class ModSettingsWindow
 		_incrementEcho.horizontalOverflow = HorizontalWrapMode.Wrap;
 		_incrementEcho.verticalOverflow = VerticalWrapMode.Overflow;
 		CreateButton(group, "SaveProactive", "保存主动对话", new Vector2(0f, -222f), new Vector2(180f, 34f), SaveProactive);
+		// 提示词不放进面板里编辑：直接开 JSON，改完保存即热载入。
+		CreateButton(group, "OpenPromptsFile", "提示词文件", new Vector2(200f, -222f), new Vector2(160f, 34f), OpenPromptsFile);
+		CreateText(group, "PromptsHint", "主动对话与窥屏的提示词都在 local.just_lilith.prompts.json，改完保存即生效（不用重启）。", 12, TextAnchor.UpperLeft, new Vector2(0f, -262f), new Vector2(ContentWidth, 40f), FontStyle.Normal, Muted);
 	}
 
 	private void BuildPeekGroup(Transform group)
@@ -1497,6 +1500,22 @@ internal sealed class ModSettingsWindow
 		catch (Exception error)
 		{
 			ReportEdit("打开配置目录失败：" + error.GetType().Name, isError: true);
+		}
+	}
+
+	/// <summary>打开提示词 JSON（不存在就先写一份默认值）；改完保存由服务按 mtime 热载入。</summary>
+	private void OpenPromptsFile()
+	{
+		try
+		{
+			string path = Path.Combine(Paths.ConfigPath, ProactivePrompts.FileName);
+			ProactivePromptsStore.EnsureExists(path);
+			Process.Start("explorer.exe", "\"" + path + "\"");
+			ReportEdit("已打开提示词文件（改完保存即生效）", isError: false);
+		}
+		catch (Exception error)
+		{
+			ReportEdit("打开提示词文件失败：" + error.GetType().Name, isError: true);
 		}
 	}
 

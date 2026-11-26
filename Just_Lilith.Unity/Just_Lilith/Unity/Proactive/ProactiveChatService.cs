@@ -42,6 +42,13 @@ internal sealed class ProactiveChatService : IDisposable
 
 	private readonly string _settingsPath;
 
+	/// <summary>提示词文件路径（local.just_lilith.prompts.json），和主动对话配置放同一目录。</summary>
+	private readonly string _promptsPath;
+
+	private ProactivePrompts _prompts = new ProactivePrompts();
+
+	private DateTime _promptsStamp = DateTime.MinValue;
+
 	private readonly System.Random _random = new System.Random();
 
 	private ProactiveSettings _settings;
@@ -135,9 +142,14 @@ internal sealed class ProactiveChatService : IDisposable
 			_sceneMemoryPath = settingsPath + ".scene-memory.json";
 			_sceneMemory = Array.Empty<SceneMemoryEntry>();
 		}
+		_promptsPath = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(settingsPath)) ?? ".", ProactivePrompts.FileName);
 		_probe = new ProactiveContextProbe(log);
 		_generator = new ProactiveGenerator(_random);
 		_settings = ProactiveSettingsStore.LoadOrCreate(settingsPath, out string? diagnostic);
+		_prompts = ProactivePromptsStore.LoadOrCreate(_promptsPath, out string? promptsDiagnostic);
+		_generator.Prompts = _prompts;
+		_controller.SetProactivePrompts(_prompts);
+		_promptsStamp = ReadPromptsStamp();
 		_staged = new StagedCueQueue(_settings.StageLimit);
 		_settingsStamp = ReadStamp();
 		_lastUserMessageAt = Time.unscaledTime;
@@ -146,6 +158,11 @@ internal sealed class ProactiveChatService : IDisposable
 		{
 			Log("module=Proactive; state=settings_fallback; reason=" + diagnostic + "; path_preserved=true");
 		}
+		if (promptsDiagnostic != null)
+		{
+			Log("module=Proactive; state=prompts_fallback; reason=" + promptsDiagnostic + "; path_preserved=true");
+		}
+		Log("module=Proactive; state=prompts; path=" + _promptsPath + "; shapes=" + ((_prompts.TopicShapes == null) ? 0 : _prompts.TopicShapes.Count));
 		Log("module=Proactive; state=ready; enabled=" + Bool(_settings.Enabled) + "; target_s=" + _settings.TargetIntervalSeconds + "; period_s=" + _settings.CheckPeriodSeconds + "; cap=" + _settings.MaxPerUserMessage + "; increment=" + InterestModel.DescribeIncrement(InterestModel.SolveIncrement(_settings.TargetIntervalSeconds, _settings.MaxPerUserMessage, _settings.CheckPeriodSeconds)) + "; peek=" + Bool(_settings.Sources.Screen && !string.IsNullOrWhiteSpace(_settings.VisionProfileId)) + "; scene_memory=" + _sceneMemory.Count);
 		if (_settings.Enabled && _settings.Sources.Screen)
 		{
@@ -175,6 +192,7 @@ internal sealed class ProactiveChatService : IDisposable
 		{
 			double now = Time.unscaledTime;
 			ReloadSettingsIfChanged();
+			ReloadPromptsIfChanged();
 			ResetStuckPeekIfNeeded(now);
 			ProactiveSettings settings = _settings;
 			if (!settings.Enabled)
@@ -886,6 +904,33 @@ internal sealed class ProactiveChatService : IDisposable
 		{
 			return DateTime.MinValue;
 		}
+	}
+
+	private DateTime ReadPromptsStamp()
+	{
+		try
+		{
+			return File.Exists(_promptsPath) ? File.GetLastWriteTimeUtc(_promptsPath) : DateTime.MinValue;
+		}
+		catch (Exception)
+		{
+			return DateTime.MinValue;
+		}
+	}
+
+	/// <summary>提示词文件改动即热载入（和 settings 一样按 mtime 判断），不用重启游戏。</summary>
+	private void ReloadPromptsIfChanged()
+	{
+		DateTime stamp = ReadPromptsStamp();
+		if (stamp == _promptsStamp)
+		{
+			return;
+		}
+		_promptsStamp = stamp;
+		_prompts = ProactivePromptsStore.LoadOrCreate(_promptsPath, out string? diagnostic);
+		_generator.Prompts = _prompts;
+		_controller.SetProactivePrompts(_prompts);
+		Log("module=Proactive; event=prompts_reloaded; path=" + _promptsPath + "; shapes=" + ((_prompts.TopicShapes == null) ? 0 : _prompts.TopicShapes.Count) + ((diagnostic != null) ? ("; reason=" + diagnostic) : ""));
 	}
 
 	private void LogEvent(string node, string source, double? interest = null, double? chance = null, int? count = null, int? cap = null, string? reason = null, string? extra = null)

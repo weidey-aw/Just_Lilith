@@ -11,6 +11,7 @@ using BepInEx.Logging;
 using Just_Lilith.Core.Agent;
 using Just_Lilith.Core.Contracts;
 using Just_Lilith.Core.Llm;
+using Just_Lilith.Core.Proactive;
 using Just_Lilith.Core.Speech;
 using Just_Lilith.Core.Threading;
 using Just_Lilith.Unity.Speech;
@@ -1552,7 +1553,7 @@ public sealed class LlmConfigurationController : IDisposable
 		try
 		{
 			using CancellationTokenSource cancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
-			string raw = await _client.TranscribeImageAsync(visionProfile, ScreenTranscribeSystemPrompt, ScreenTranscribeUserPrompt, jpeg, TimeSpan.FromSeconds(Math.Clamp(timeoutSeconds, 5, 60)), cancellation.Token).ConfigureAwait(continueOnCapturedContext: false);
+			string raw = await _client.TranscribeImageAsync(visionProfile, _proactivePrompts.ScreenTranscribeSystem, _proactivePrompts.ScreenTranscribeUser, jpeg, TimeSpan.FromSeconds(Math.Clamp(timeoutSeconds, 5, 60)), cancellation.Token).ConfigureAwait(continueOnCapturedContext: false);
 			description = NormalizeScreenDescription(raw);
 			if (description == null)
 			{
@@ -1620,10 +1621,14 @@ public sealed class LlmConfigurationController : IDisposable
 		}
 	}
 
-	// 转述提示词（2.4）：身份 + 授权说明 + 200 字 + 别描述本应用的聊天窗口。
-	private const string ScreenTranscribeSystemPrompt = "你是图像信息转述者，把看到的画面描述给另一个 AI。用户开放了那个 AI 的自主窥屏功能。抓重点，用中文写 200 字左右的一段话。如果看到聊天窗口、角色立绘和对话框，不要描述这部分，那是玩家与 AI 的聊天窗口。";
+	// 窥屏转述提示词（2.4）：从 prompts.json 读，服务热更新时由 SetProactivePrompts 换掉。
+	private ProactivePrompts _proactivePrompts = new ProactivePrompts();
 
-	private const string ScreenTranscribeUserPrompt = "请转述这张截图。只写一段 200 字左右的中文描述：抓重点，不要分点、不要标题、不要代码围栏，不要推测画面之外的东西，也不要复述这段说明。";
+	/// <summary>换一套提示词（配置文件热更新时由主动对话服务调用）。</summary>
+	internal void SetProactivePrompts(ProactivePrompts prompts)
+	{
+		_proactivePrompts = prompts ?? new ProactivePrompts();
+	}
 
 	private void LogProactiveSkipped(string reason)
 	{

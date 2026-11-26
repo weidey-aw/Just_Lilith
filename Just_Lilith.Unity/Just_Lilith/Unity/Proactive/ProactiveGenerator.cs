@@ -16,10 +16,10 @@ internal sealed class ProactiveGenerator
 	/// <summary>话题形状轮换：最近两轮用过的形状先不用。</summary>
 	private const int ShapeHistoryLimit = 2;
 
-	/// <summary>话题形状候选。只是给模型一个方向，不给固定句式。</summary>
-	private static readonly string[] TopicShapes = new string[4] { "关心一下她刚才在忙的事", "问一件具体的小事", "说一句你自己的小情绪", "吐槽一句眼前看到的东西" };
-
 	private readonly Random _random;
+
+	/// <summary>提示词（来自 local.just_lilith.prompts.json，可热更新）。</summary>
+	private ProactivePrompts _prompts = new ProactivePrompts();
 
 	private readonly List<string> _recentReplies = new List<string>();
 
@@ -46,6 +46,19 @@ internal sealed class ProactiveGenerator
 	public ProactiveGenerator(Random random)
 	{
 		_random = random ?? throw new ArgumentNullException("random");
+	}
+
+	/// <summary>换一套提示词（配置文件热更新时由服务调用）。</summary>
+	internal ProactivePrompts Prompts
+	{
+		get
+		{
+			return _prompts;
+		}
+		set
+		{
+			_prompts = value ?? new ProactivePrompts();
+		}
 	}
 
 	/// <summary>记一条刚刚真的说出去的主动发言（只留前 40 字）。</summary>
@@ -150,10 +163,11 @@ internal sealed class ProactiveGenerator
 		int minutes = Math.Max(0, idleSeconds / 60);
 		string duration = ((minutes >= 1) ? (minutes + " 分钟") : "一会儿");
 		string shape = PickTopicShape();
-		return "（本次是你自己主动开口，不是在回应某条提问。）" + "用户已经 " + duration + "没有新的输入了，也没有在等你回答什么。" + "请你自己找个由头说一两句，语气自然、轻松。这次可以顺着这个方向：" + shape + "。" + BuildAvoidRepeatClause() + "不要解释你为什么突然说话，不要提到“主动”“系统”“提示”这类词，也不要复述这段说明。" + AppendMemory(sceneMemory);
+		return _prompts.IdleInstruction.Replace("{duration}", duration).Replace("{shape}", shape).Replace("{recent_clause}", BuildAvoidRepeatClause())
+			.Replace("{memory}", AppendMemory(sceneMemory));
 	}
 
-	/// <summary>最近几轮说过的话 + 明确要求换话题。</summary>
+	/// <summary>最近几轮说过的话 + 明确要求换话题（模板在 avoid_repeat_clause）。</summary>
 	private string BuildAvoidRepeatClause()
 	{
 		lock (_sync)
@@ -163,24 +177,29 @@ internal sealed class ProactiveGenerator
 				return "";
 			}
 			string joined = string.Join("；", _recentReplies);
-			return "你最近已经主动说过这些：" + joined + "。这次不要重复这些话题，也不要顺着它们继续往下续。" + "如果确实想不出新话题，就直接问她一个具体的小问题。";
+			return _prompts.AvoidRepeatClause.Replace("{recent}", joined);
 		}
 	}
 
-	/// <summary>挑一个最近两轮没用过的话题形状。</summary>
+	/// <summary>挑一个最近两轮没用过的话题形状（候选来自 topic_shapes）。</summary>
 	private string PickTopicShape()
 	{
 		lock (_sync)
 		{
-			List<string> available = new List<string>(4);
-			foreach (string shape in TopicShapes)
+			IReadOnlyList<string> shapes = _prompts.TopicShapes;
+			if (shapes == null || shapes.Count == 0)
+			{
+				return "";
+			}
+			List<string> available = new List<string>(shapes.Count);
+			foreach (string shape in shapes)
 			{
 				if (!_recentShapes.Contains(shape))
 				{
 					available.Add(shape);
 				}
 			}
-			string picked = ((available.Count > 0) ? available[_random.Next(available.Count)] : TopicShapes[_random.Next(TopicShapes.Length)]);
+			string picked = ((available.Count > 0) ? available[_random.Next(available.Count)] : shapes[_random.Next(shapes.Count)]);
 			_recentShapes.Add(picked);
 			while (_recentShapes.Count > ShapeHistoryLimit)
 			{
@@ -192,12 +211,13 @@ internal sealed class ProactiveGenerator
 	}
 
 	/// <summary>
-	/// 窥屏由头。除了给画面，还把 2.6 的表达约束一起写进这条系统指令：
+	/// 窥屏由头。除了给画面，还把表达约束一起写进这条系统指令：
 	/// 只挑最在意的一点、不逐条念画面、隐私不出口、不把屏幕当用户发言、不描述自己的窗口。
+	/// 措辞在 prompts.json 的 screen_cue_instruction 里。
 	/// </summary>
-	private static string BuildScreenInstruction(string description, string? sceneMemory)
+	private string BuildScreenInstruction(string description, string? sceneMemory)
 	{
-		return "（本次是你自己主动开口，不是在回应某条提问。）" + "你刚才瞥了一眼桌面，看到的是：" + description.Trim() + "。" + "请就着这个画面自然地说一两句：只挑你最在意的一点讲，不要逐条复述画面，也不要像在念清单。" + "如果画面里有聊天窗口、角色立绘或对话框，那就当没看见，不要描述它们。" + "不要说出账号、密码、私聊内容或别人的姓名；不要把画面里的东西当成用户说过的话。" + "不要提到“截图”“屏幕”“系统”这类词，也不要解释你为什么突然开口。" + AppendMemory(sceneMemory);
+		return _prompts.ScreenCueInstruction.Replace("{description}", description.Trim()).Replace("{memory}", AppendMemory(sceneMemory));
 	}
 
 	private static string AppendMemory(string? sceneMemory)
