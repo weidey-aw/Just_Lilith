@@ -208,6 +208,9 @@ internal sealed class ModSettingsWindow
 
 	private bool _placementLogged;
 
+	/// <summary>标题条找不到时只报一次（正常不该出现）。</summary>
+	private bool _dragHeaderMissingLogged;
+
 	private bool _fallbackLogged;
 
 	/// <summary>桌面锚点算不出来时只记一次原因，方便排查（正常情况不该出现）。</summary>
@@ -277,6 +280,7 @@ internal sealed class ModSettingsWindow
 			_editStatus = "";
 			_page.SetActive(value: true);
 			_page.transform.SetAsLastSibling();
+			EnsureDragHeader();
 			ShowGroup(_activeGroup);
 			RefreshWidgets();
 			RequestFullMonitorForPage();
@@ -293,7 +297,8 @@ internal sealed class ModSettingsWindow
 	{
 		bool wasOpen = IsOpen;
 		_dragging = false;
-		_dragHeader = null;
+		// 注意：不要在这里把 _dragHeader 清空。页面只是 SetActive(false)，
+		// 下次 Open() 不会再走 Build()，标题条引用一清空就再也拖不动了。
 		ReleaseApiPanel();
 		ReleaseFullMonitorForPage();
 		if (_page != null)
@@ -1680,8 +1685,36 @@ internal sealed class ModSettingsWindow
 	}
 
 	/// <summary>
-	/// 把页面放到桌面可视区里：fresh=true 时居中（屏幕中心），否则只按已有锚点复定位。
+	/// 标题条（拖动用的那条）只在 Build() 里建一次；关掉再打开时 Build 不会再跑，
+	/// 所以这里兜底按名字重新挂一次引用 —— 否则第二次打开就拖不动了。
 	/// </summary>
+	private void EnsureDragHeader()
+	{
+		if (_dragHeader != null || _page == null)
+		{
+			return;
+		}
+		try
+		{
+			Transform header = _page.transform.Find("ModDragHeader");
+			if (header != null)
+			{
+				_dragHeader = header.GetComponent<RectTransform>();
+				Log("event=drag_header_rebound");
+			}
+			else if (!_dragHeaderMissingLogged)
+			{
+				_dragHeaderMissingLogged = true;
+				Log("state=drag_header_missing; detail=标题条找不到，本轮不能拖动");
+			}
+		}
+		catch (Exception error)
+		{
+			Log("state=drag_header_rebind_failed; error=" + error.GetType().Name);
+		}
+	}
+
+	/// <summary>把页面放到桌面可视区里：fresh=true 时居中（屏幕中心），否则只按已有锚点复定位。</summary>
 	private void PlaceOnVisibleArea(bool fresh)
 	{
 		if (_pageRect == null || _canvasRoot == null)
