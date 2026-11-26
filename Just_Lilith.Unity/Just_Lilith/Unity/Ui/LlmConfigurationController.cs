@@ -1421,19 +1421,43 @@ public sealed class LlmConfigurationController : IDisposable
 			try
 			{
 				await _memoryTask.WaitAsync(operation.Token).ConfigureAwait(continueOnCapturedContext: false);
-				(string SystemPrompt, ActiveConversationSnapshot Session, IReadOnlyList<ChatMessage> Messages) context = await Task.Run(delegate
+				// 主动/窥屏也要带上记忆与当前状态：以前这里只拼历史 + 指令，
+				// 结果她主动开口时看不到做梦总结的记忆、也不知道自己现在是什么状态。
+				PetStateSnapshot proactivePetState;
+				try
+				{
+					proactivePetState = _petState.CapturePetState();
+				}
+				catch (Exception ex4)
+				{
+					ManualLogSource log3 = _log;
+					if (log3 != null)
+					{
+						log3.LogWarning("module=PetState; state=capture_failed; code=" + ex4.GetType().Name + "; fallback=unknown; text_logged=false");
+					}
+					proactivePetState = PetStateContextBuilder.CreateSnapshot(new PetStateObservation(DateTimeOffset.UtcNow));
+				}
+				(string SystemPrompt, ActiveConversationSnapshot Session, IReadOnlyList<ChatMessage> Messages, string? MemoryReference, string? CurrentReference, int TurnCount) context = await Task.Run(delegate
 				{
 					operation.Token.ThrowIfCancellationRequested();
 					string systemPrompt = _conversation.LoadSystemPrompt();
 					// 不在主动路径调 EnsureCanAppend：空 user 会被文本校验挡掉。
 					ActiveConversationSnapshot session = _activeConversation.LoadOrCreate(profile.ProfileId, profile.ModelId, profile.BaseUrl, profile.ProtectedApiKey);
 					IReadOnlyList<ChatMessage> messages = ConversationContextBuilder.BuildProactive(session, instruction);
-					return (SystemPrompt: systemPrompt, Session: session, Messages: messages);
+					// 只补记忆与状态；世界书要按用户输入匹配，主动路径没有输入，先不带。
+					string? memoryReference = ConversationContextBuilder.BuildMemoryReference(session);
+					string? currentReference = PetStateContextBuilder.CombineWithWorldBook(WorldBookContextBuilder.Build(Array.Empty<WorldBookMatch>()), proactivePetState);
+					return (SystemPrompt: systemPrompt, Session: session, Messages: messages, MemoryReference: memoryReference, CurrentReference: currentReference, TurnCount: session.Conversation.Turns.Count);
 				}, operation.Token).ConfigureAwait(continueOnCapturedContext: false);
+				ManualLogSource contextLog = _log;
+				if (contextLog != null)
+				{
+					contextLog.LogInfo("module=Proactive; event=context; source=" + (string.IsNullOrEmpty(sourceTag) ? "idleChat" : sourceTag) + "; turns=" + context.TurnCount + "; memory=" + (context.MemoryReference != null) + "; state=" + (context.CurrentReference != null));
+				}
 				SpeechLanguage speechLanguage = _speech?.Settings.Language ?? SpeechLanguage.Chinese;
 				bool speechEnabled = _speech?.CanSpeak ?? false;
 				long speechGeneration = _speech?.Generation ?? 0;
-				ParsedChatReply parsedReply = StructuredChatReply.Parse(await _client.CompleteAsync(profile, context.Messages, StructuredChatReply.BuildSystemPrompt(context.SystemPrompt, speechLanguage), operation.Token, speechLanguage == SpeechLanguage.Japanese, null, null).ConfigureAwait(continueOnCapturedContext: false), speechLanguage);
+				ParsedChatReply parsedReply = StructuredChatReply.Parse(await _client.CompleteAsync(profile, context.Messages, StructuredChatReply.BuildSystemPrompt(context.SystemPrompt, speechLanguage), operation.Token, speechLanguage == SpeechLanguage.Japanese, context.MemoryReference, context.CurrentReference).ConfigureAwait(continueOnCapturedContext: false), speechLanguage);
 				DateTimeOffset receivedAtUtc = DateTimeOffset.UtcNow;
 				// 先回传正文：主动对话那边要记住「最近说过什么」，用来避免复读同一个话题。
 				try
